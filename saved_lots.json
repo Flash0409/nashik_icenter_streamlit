@@ -1,0 +1,25 @@
+{
+  "volta lot 1": {
+    "project": "Volta Taziz DCS",
+    "work_orders": [
+      "-- All --"
+    ],
+    "items": [
+      "NKAEPW336071800G06",
+      "NKAEPW336071800G07"
+    ],
+    "item_labels": [
+      "NKAEPW336071800G06 \u2014 SYS CAB -01",
+      "NKAEPW336071800G07 \u2014 SYS CAB -02"
+    ],
+    "work_order_count": 0,
+    "item_count": 2,
+    "work_order": "All",
+    "item": "NKAEPW336071800G06, NKAEPW336071800G07",
+    "saved_at": "2026-03-26T15:18:01.966488",
+    "component_count": 64,
+    "short_components": 0,
+    "total_open_qty": 4939,
+    "total_required_qty": 4939
+  }
+}
