@@ -158,26 +158,17 @@ def save_lots(lots: dict):
 
 
 def robust_to_datetime(series: pd.Series) -> pd.Series:
-    """Try multiple date parsing strategies and pick the one that parses most values."""
     if series.dropna().empty:
         return pd.to_datetime(series, errors="coerce")
-
     best_result = None
     best_count = -1
-
-    strategies = [
-        dict(dayfirst=False),
-        dict(dayfirst=True),
-    ]
-
+    strategies = [dict(dayfirst=False), dict(dayfirst=True)]
     for kwargs in strategies:
         result = pd.to_datetime(series, errors="coerce", **kwargs)
         count = result.notna().sum()
         if count > best_count:
             best_result = result
             best_count = count
-
-    # Also try format="mixed" variants (pandas >= 2.0)
     for dayfirst in [False, True]:
         try:
             result = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=dayfirst)
@@ -187,7 +178,6 @@ def robust_to_datetime(series: pd.Series) -> pd.Series:
                 best_count = count
         except Exception:
             pass
-
     return best_result if best_result is not None else pd.to_datetime(series, errors="coerce")
 
 
@@ -254,13 +244,11 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
     best_sheet = None
     best_score = -1
     best_header_row = 0
-    
+
     for sheet in sheet_names:
         try:
-            # Try multiple header rows (0, 1, 2) to find the best match
             best_score_for_sheet = -1
             best_header_for_sheet = 0
-            
             for header_row in [0, 1, 2]:
                 try:
                     header_df = clean_columns(pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=header_row, nrows=5, engine="openpyxl"))
@@ -270,12 +258,9 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
                         best_header_for_sheet = header_row
                 except Exception:
                     continue
-            
-            # If this sheet has a better score overall, select it
             sheet_name_norm = str(sheet).strip().lower().replace("_", " ")
             if any(k in sheet_name_norm for k in preferred_keywords):
                 best_score_for_sheet += 1
-            
             if best_score_for_sheet > best_score:
                 best_sheet = sheet
                 best_score = best_score_for_sheet
@@ -285,7 +270,6 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
 
     if best_sheet is None:
         return None, None, 0, sheet_names
-
     df_selected = clean_columns(pd.read_excel(BytesIO(file_bytes), sheet_name=best_sheet, header=best_header_row, engine="openpyxl"))
     return df_selected, best_sheet, best_score, sheet_names
 
@@ -513,23 +497,19 @@ stk_locator_col = find_col(df_stock, STK_LOCATOR)
 # ─────────────────────────────────────────────────
 # PARSE NUMERICS & DATES
 # ─────────────────────────────────────────────────
-# Parse Forecasting numerics
 numeric_cols_fc = [fc_cab_qty_col]
 for nc in numeric_cols_fc:
     if nc and nc in df_fc.columns:
         df_fc[nc] = parse_numeric(df_fc[nc])
 
-# Parse ALL forecasting date columns with robust parser (only once)
 _fc_date_cols_to_parse = set()
 for dc in [fc_need_by_col, fc_fat_start_col, fc_asm_start_col, fc_asm_end_col,
            fc_mat_avail_col, fc_bom_avail_col, fc_promised_build_col, fc_promised_ship_col, fc_actual_ship_col]:
     if dc and dc in df_fc.columns:
         _fc_date_cols_to_parse.add(dc)
-
 for dc in _fc_date_cols_to_parse:
     df_fc[dc] = robust_to_datetime(df_fc[dc])
 
-# BOM numerics & dates
 for nc in [bom_req_qty_col, bom_issued_qty_col, bom_open_qty_col, bom_onhand_col,
            bom_variance_col, bom_total_avail_col, bom_po_recv_col, bom_total_demand_col, bom_net_ext_col]:
     if nc and nc in df_bom.columns:
@@ -557,29 +537,67 @@ else:
 
 
 # ─────────────────────────────────────────────────
-# LOT ASSIGNMENT PERSISTENCE
+# ROW-LEVEL LOT ASSIGNMENT PERSISTENCE
 # ─────────────────────────────────────────────────
-LOT_ASSIGNMENTS_FILE = "lot_assignments.json"
+ROW_LOT_ASSIGNMENTS_FILE = "row_lot_assignments.json"
 
-def load_lot_assignments() -> dict:
-    if os.path.exists(LOT_ASSIGNMENTS_FILE):
-        with open(LOT_ASSIGNMENTS_FILE, "r") as f:
+def load_row_lot_assignments() -> dict:
+    """Load row-level lot assignments. Key = row_key, Value = list of lot names."""
+    if os.path.exists(ROW_LOT_ASSIGNMENTS_FILE):
+        with open(ROW_LOT_ASSIGNMENTS_FILE, "r") as f:
             return json.load(f)
     return {}
 
-def save_lot_assignments(assignments: dict):
-    with open(LOT_ASSIGNMENTS_FILE, "w") as f:
+def save_row_lot_assignments(assignments: dict):
+    with open(ROW_LOT_ASSIGNMENTS_FILE, "w") as f:
         json.dump(assignments, f, indent=2, default=str)
 
 
 # ─────────────────────────────────────────────────
-# DATE FORMATTER for display
+# ROW KEY HELPERS
 # ─────────────────────────────────────────────────
+ROW_KEY_SEP = "|||"
+
+def make_fc_row_key(row, proj_col, bp_col, asm_col, idx=None):
+    """Create a unique key for a forecasting schedule row using project + build period + assembly start + index."""
+    pname = str(row.get(proj_col, "")).strip() if pd.notna(row.get(proj_col)) else ""
+    bp = str(row.get(bp_col, "")).strip() if bp_col and pd.notna(row.get(bp_col)) else ""
+    asm = ""
+    if asm_col and pd.notna(row.get(asm_col)):
+        val = row[asm_col]
+        asm = val.strftime("%Y-%m-%d") if isinstance(val, pd.Timestamp) else str(val)
+    idx_str = str(idx) if idx is not None else ""
+    return f"{pname}{ROW_KEY_SEP}{bp}{ROW_KEY_SEP}{asm}{ROW_KEY_SEP}{idx_str}"
+
+
+def make_fc_row_label(row, proj_col, bp_col, asm_col):
+    """Create a display label for a forecasting row."""
+    pname = str(row.get(proj_col, "")).strip() if pd.notna(row.get(proj_col)) else "Unknown"
+    bp = str(row.get(bp_col, "")).strip() if bp_col and pd.notna(row.get(bp_col)) else "N/A"
+    asm = "N/A"
+    if asm_col and pd.notna(row.get(asm_col)):
+        val = row[asm_col]
+        asm = val.strftime("%d-%b-%Y") if isinstance(val, pd.Timestamp) else str(val)
+    return f"{pname}  |  Build: {bp}  |  Asm Start: {asm}"
+
+
 def format_date_col(series: pd.Series) -> pd.Series:
-    """Format datetime series to DD-Mon-YYYY string for display."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return series.dt.strftime("%d-%b-%Y").fillna("")
     return series
+
+
+# ─────────────────────────────────────────────────
+# ADD ROW KEYS TO FORECASTING DF
+# ─────────────────────────────────────────────────
+df_fc["_row_key"] = [
+    make_fc_row_key(row, fc_proj_name_col, fc_build_period_col, fc_asm_start_col, idx=i)
+    for i, row in df_fc.iterrows()
+]
+df_fc["_row_label"] = [
+    make_fc_row_label(row, fc_proj_name_col, fc_build_period_col, fc_asm_start_col)
+    for _, row in df_fc.iterrows()
+]
 
 
 # ─────────────────────────────────────────────────
@@ -716,8 +734,8 @@ with tab_project:
                 if sc and sc in comp_base.columns and sc not in group_keys: agg_map[sc] = "sum"
             for mc in [bom_onhand_col, bom_variance_col]:
                 if mc and mc in comp_base.columns and mc not in group_keys: agg_map[mc] = "max"
-            for fc in [bom_comp_mb_col, bom_availability_col, bom_supplier_col, bom_buyer_col, bom_mfg_lead_col, bom_wo_status_col]:
-                if fc and fc in comp_base.columns and fc not in group_keys and fc not in agg_map: agg_map[fc] = "first"
+            for fc_c in [bom_comp_mb_col, bom_availability_col, bom_supplier_col, bom_buyer_col, bom_mfg_lead_col, bom_wo_status_col]:
+                if fc_c and fc_c in comp_base.columns and fc_c not in group_keys and fc_c not in agg_map: agg_map[fc_c] = "first"
             comp_detail = comp_base.groupby(group_keys, dropna=False, as_index=False).agg(agg_map)
             if bom_wo_col and bom_wo_col in df_filtered.columns:
                 wo_counts = df_filtered.groupby(group_keys, dropna=False)[bom_wo_col].nunique().reset_index(name="Work Orders")
@@ -783,20 +801,16 @@ with tab_project:
 
 
 # ═══════════════════════════════════════════════════
-# TAB 3 – FORECASTING (with Lot Assignment)
+# TAB 3 – FORECASTING (with Row-Level Lot Assignment)
 # ═══════════════════════════════════════════════════
 with tab_forecasting:
-    st.markdown('<div class="section-header">📈 Forecasting Schedule with Lot Assignment</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📈 Forecasting Schedule with Row-Level Lot Assignment</div>', unsafe_allow_html=True)
 
     if not fc_proj_name_col:
         st.error("❌ Project Name column not found in Forecasting sheet.")
-        st.info("**Expected column names (any of these):**\n" + ", ".join(FC_PROJECT_NAME))
-        st.warning("**Detected columns in uploaded file:**")
-        col_list = ", ".join([f"'{c}'" for c in df_fc.columns[:20]])
-        st.code(col_list + ("..." if len(df_fc.columns) > 20 else ""), language="")
         st.stop()
     else:
-        # ── Build display table with ALL available forecasting columns ──
+        # ── Build display table ──
         fc_display_cols = []
         seen_cols = set()
         for c in [fc_sr_col, fc_proj_name_col, fc_proj_id_col, fc_ship_to_col, fc_bu_col, fc_type_col,
@@ -808,19 +822,18 @@ with tab_forecasting:
                 seen_cols.add(c)
 
         if not fc_display_cols:
-            fc_display_cols = [fc_proj_name_col]  # Fallback: show at least project name
+            fc_display_cols = [fc_proj_name_col]
 
-        fc_view = df_fc[fc_display_cols].copy()
+        fc_view = df_fc[fc_display_cols + ["_row_key", "_row_label"]].copy()
 
-        # Format date columns for display ONLY (don't re-parse!)
+        # Format date columns for display
         for col in fc_view.columns:
-            if pd.api.types.is_datetime64_any_dtype(fc_view[col]):
+            if col not in ["_row_key", "_row_label"] and pd.api.types.is_datetime64_any_dtype(fc_view[col]):
                 fc_view[col] = fc_view[col].dt.strftime("%d-%b-%Y").fillna("")
 
-        # Remove completely empty rows
-        fc_view = fc_view.dropna(how='all')
+        fc_view = fc_view.dropna(how='all', subset=[c for c in fc_display_cols if c in fc_view.columns])
 
-        # Show summary metrics
+        # Summary metrics
         st.markdown('<div class="section-header">📊 Forecasting Data Summary</div>', unsafe_allow_html=True)
         m1, m2, m3, m4 = st.columns(4)
         with m1:
@@ -838,72 +851,91 @@ with tab_forecasting:
                 type_counts = fc_view[fc_type_col].value_counts()
                 render_metric("Forecast Types", len(type_counts), "amber")
 
-        # Display full forecast table
-        st.markdown('<div class="section-header">📋 Forecast Schedule</div>', unsafe_allow_html=True)
-        st.dataframe(fc_view, use_container_width=True, height=500)
+        # ── ROW-LEVEL Lot Assignment ──
+        st.markdown('<div class="section-header">🔗 Assign Lots to Forecasting Schedule Rows</div>', unsafe_allow_html=True)
+        st.caption("Assign lots to specific rows identified by Project Name + Build Period + Assembly Start Date")
 
-        # ── Lot assignments ──
-        st.markdown('<div class="section-header">🔗 Assign Lots to Forecasting Projects</div>', unsafe_allow_html=True)
-        lot_assignments = load_lot_assignments()
+        row_lot_assignments = load_row_lot_assignments()
         saved_lots = load_saved_lots()
-        # Use raw project names from the forecasting sheet as-is
-        fc_projects = sorted(df_fc[fc_proj_name_col].dropna().unique().tolist())
 
         if not saved_lots:
             st.info("ℹ️  No saved lots yet. Create lots in the **Project Drill-Down** tab first.")
         else:
             lot_name_options = sorted(saved_lots.keys())
-            ac1, ac2, ac3 = st.columns([2, 2, 1])
+
+            # Build row selector options — show label but track key
+            row_options_map = {}  # label -> key
+            for _, row in fc_view.iterrows():
+                label = row["_row_label"]
+                key = row["_row_key"]
+                row_options_map[label] = key
+
+            row_labels_sorted = sorted(row_options_map.keys())
+
+            ac1, ac2, ac3 = st.columns([3, 2, 1])
             with ac1:
-                assign_project = st.selectbox("Select Forecasting Project", ["-- Select --"] + fc_projects, key="fc_assign_proj")
+                assign_row_label = st.selectbox(
+                    "Select Forecasting Row (Project | Build Period | Asm Start)",
+                    ["-- Select --"] + row_labels_sorted,
+                    key="fc_assign_row"
+                )
             with ac2:
                 assign_lots = st.multiselect("Assign Lots", lot_name_options, key="fc_assign_lots")
             with ac3:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("✅ Assign", use_container_width=True, key="fc_assign_btn"):
-                    if assign_project != "-- Select --" and assign_lots:
-                        existing = lot_assignments.get(assign_project, [])
-                        merged = list(dict.fromkeys(existing + assign_lots))
-                        lot_assignments[assign_project] = merged
-                        save_lot_assignments(lot_assignments)
-                        st.success(f"Assigned {len(assign_lots)} lot(s) to **{assign_project}**")
-                        st.rerun()
+                    if assign_row_label != "-- Select --" and assign_lots:
+                        row_key = row_options_map.get(assign_row_label, "")
+                        if row_key:
+                            existing = row_lot_assignments.get(row_key, [])
+                            merged = list(dict.fromkeys(existing + assign_lots))
+                            row_lot_assignments[row_key] = merged
+                            save_row_lot_assignments(row_lot_assignments)
+                            st.success(f"Assigned {len(assign_lots)} lot(s) to row")
+                            st.rerun()
                     else:
-                        st.error("Select both a project and at least one lot.")
+                        st.error("Select both a row and at least one lot.")
 
-            if lot_assignments:
-                with st.expander("📋 Current Lot Assignments", expanded=False):
-                    for proj, lots_list in sorted(lot_assignments.items()):
+            # Show current assignments
+            if row_lot_assignments:
+                with st.expander("📋 Current Row-Level Lot Assignments", expanded=False):
+                    # Build reverse lookup: key -> label
+                    key_to_label = {v: k for k, v in row_options_map.items()}
+                    for rk, lots_list in sorted(row_lot_assignments.items(), key=lambda x: x[0]):
                         if lots_list:
+                            display_label = key_to_label.get(rk, rk)
                             chips = " ".join([f'<span class="lot-chip">{l}</span>' for l in lots_list])
-                            st.markdown(f"**{proj}:** {chips}", unsafe_allow_html=True)
+                            st.markdown(f"**{display_label}:** {chips}", unsafe_allow_html=True)
+
                     st.markdown("---")
-                    rc1, rc2, rc3 = st.columns([2, 2, 1])
+                    rc1, rc2, rc3 = st.columns([3, 2, 1])
                     with rc1:
-                        rm_project = st.selectbox("Remove from project", ["-- Select --"] + sorted(lot_assignments.keys()), key="fc_rm_proj")
+                        # Show only assigned rows for removal
+                        assigned_labels = [key_to_label.get(k, k) for k in row_lot_assignments.keys() if row_lot_assignments[k]]
+                        rm_row_label = st.selectbox("Remove from row", ["-- Select --"] + sorted(assigned_labels), key="fc_rm_row")
                     with rc2:
-                        rm_options = lot_assignments.get(rm_project, []) if rm_project != "-- Select --" else []
+                        rm_row_key = row_options_map.get(rm_row_label, "") if rm_row_label != "-- Select --" else ""
+                        rm_options = row_lot_assignments.get(rm_row_key, [])
                         rm_lots = st.multiselect("Lots to remove", rm_options, key="fc_rm_lots")
                     with rc3:
                         st.markdown("<br>", unsafe_allow_html=True)
                         if st.button("🗑️ Remove", use_container_width=True, key="fc_rm_btn"):
-                            if rm_project != "-- Select --" and rm_lots:
-                                lot_assignments[rm_project] = [l for l in lot_assignments.get(rm_project, []) if l not in rm_lots]
-                                if not lot_assignments[rm_project]:
-                                    del lot_assignments[rm_project]
-                                save_lot_assignments(lot_assignments)
+                            if rm_row_key and rm_lots:
+                                row_lot_assignments[rm_row_key] = [l for l in row_lot_assignments.get(rm_row_key, []) if l not in rm_lots]
+                                if not row_lot_assignments[rm_row_key]:
+                                    del row_lot_assignments[rm_row_key]
+                                save_row_lot_assignments(row_lot_assignments)
                                 st.rerun()
 
-        # ── Enrich table with lot info ──
+        # ── Enrich table with lot info per row ──
         lot_col_assigned = []
         lot_col_comp_count = []
         lot_col_short = []
         lot_col_open_qty = []
 
-        for _, row in df_fc.iterrows():
-            pname = row.get(fc_proj_name_col, "")
-            pname_str = str(pname).strip() if pd.notna(pname) else ""
-            assigned = [l for l in lot_assignments.get(pname_str, []) if l in saved_lots]
+        for _, row in fc_view.iterrows():
+            rk = row["_row_key"]
+            assigned = [l for l in row_lot_assignments.get(rk, []) if l in saved_lots]
 
             if assigned:
                 lot_col_assigned.append(", ".join(assigned))
@@ -921,9 +953,12 @@ with tab_forecasting:
         fc_view["Lot Shortages"] = lot_col_short
         fc_view["Lot Open Qty"] = lot_col_open_qty
 
-        # Sort by need-by date (use original parsed column for sort order)
-        if fc_need_by_col and fc_need_by_col in df_fc.columns:
-            fc_view = fc_view.iloc[df_fc[fc_need_by_col].sort_values(na_position="last").index].reset_index(drop=True)
+        # Sort by assembly start date
+        if fc_asm_start_col and fc_asm_start_col in df_fc.columns:
+            sort_order = df_fc[fc_asm_start_col].sort_values(na_position="last").index
+            # Reindex fc_view to match sort order for rows that exist
+            valid_idx = [i for i in sort_order if i in fc_view.index]
+            fc_view = fc_view.loc[valid_idx].reset_index(drop=True)
 
         # ── Filters ──
         flt1, flt2, flt3 = st.columns(3)
@@ -947,150 +982,262 @@ with tab_forecasting:
         if fc_search:
             fc_display = fc_display[fc_display[fc_proj_name_col].astype(str).str.contains(fc_search, case=False, na=False)]
 
-        # ── Metrics ──
+        # ── Display metrics ──
         m1, m2, m3, m4 = st.columns(4)
-        with m1: render_metric("Projects Shown", len(fc_display), "blue")
+        with m1: render_metric("Rows Shown", len(fc_display), "blue")
         with m2: render_metric("With Lots", int((fc_display["Assigned Lots"] != "").sum()), "purple")
         with m3: render_metric("Total Lot Shortages", int(fc_display["Lot Shortages"].sum()), "red")
         with m4:
             if fc_cab_qty_col and fc_cab_qty_col in fc_display.columns:
                 render_metric("Total Cabinets", int(parse_numeric(fc_display[fc_cab_qty_col]).sum()), "cyan")
 
-        st.markdown("")
-        st.dataframe(fc_display, use_container_width=True, height=550)
+        # Drop internal columns for display
+        display_table = fc_display.drop(columns=["_row_key", "_row_label"], errors="ignore")
+        st.dataframe(display_table, use_container_width=True, height=550)
         st.caption(f"Showing {len(fc_display):,} of {len(fc_view):,} rows.")
 
-        # ── Lot detail drill-down ──
-        if lot_assignments:
-            st.markdown('<div class="section-header">Lot Component Detail per Project</div>', unsafe_allow_html=True)
-            projects_with_lots = {p: [l for l in ls if l in saved_lots] for p, ls in lot_assignments.items() if ls}
-            projects_with_lots = {p: ls for p, ls in projects_with_lots.items() if ls}
+        # ── Lot detail drill-down per row ──
+        rows_with_lots = fc_display[fc_display["Assigned Lots"] != ""]
+        if not rows_with_lots.empty:
+            st.markdown('<div class="section-header">Lot Component Detail per Row</div>', unsafe_allow_html=True)
+            detail_row_labels = rows_with_lots["_row_label"].tolist()
+            detail_row_sel = st.selectbox("Select row to view lot details", ["-- Select --"] + detail_row_labels, key="fc_lot_detail_row")
 
-            if projects_with_lots:
-                detail_project = st.selectbox("Select project to view lot details", ["-- Select --"] + sorted(projects_with_lots.keys()), key="fc_lot_detail_proj")
-                if detail_project != "-- Select --":
-                    for lot_nm in projects_with_lots.get(detail_project, []):
-                        lot_info = saved_lots.get(lot_nm, {})
-                        if not lot_info:
-                            continue
-                        with st.expander(f"📦 Lot: **{lot_nm}**", expanded=True):
-                            d1, d2, d3, d4 = st.columns(4)
-                            with d1: st.metric("BOM Project", lot_info.get("project", "N/A"))
-                            with d2: st.metric("Work Orders", lot_info.get("work_order_count", "N/A"))
-                            with d3: st.metric("Components", lot_info.get("component_count", 0))
-                            with d4: st.metric("Short", lot_info.get("short_components", 0))
-                            st.caption(f"Items: {lot_info.get('item', 'All')}  |  Saved: {lot_info.get('saved_at', 'N/A')}")
+            if detail_row_sel != "-- Select --":
+                sel_row = rows_with_lots[rows_with_lots["_row_label"] == detail_row_sel].iloc[0]
+                sel_rk = sel_row["_row_key"]
+                assigned_lot_names = [l for l in row_lot_assignments.get(sel_rk, []) if l in saved_lots]
 
-                            # Reconstruct BOM for this lot
-                            lot_bom_project = lot_info.get("project", "")
-                            lot_wo_list = lot_info.get("work_orders", ["-- All --"])
-                            lot_item_list = lot_info.get("items", ["-- All --"])
+                for lot_nm in assigned_lot_names:
+                    lot_info = saved_lots.get(lot_nm, {})
+                    if not lot_info:
+                        continue
+                    with st.expander(f"📦 Lot: **{lot_nm}**", expanded=True):
+                        d1, d2, d3, d4 = st.columns(4)
+                        with d1: st.metric("BOM Project", lot_info.get("project", "N/A"))
+                        with d2: st.metric("Work Orders", lot_info.get("work_order_count", "N/A"))
+                        with d3: st.metric("Components", lot_info.get("component_count", 0))
+                        with d4: st.metric("Short", lot_info.get("short_components", 0))
+                        st.caption(f"Items: {lot_info.get('item', 'All')}  |  Saved: {lot_info.get('saved_at', 'N/A')}")
 
-                            df_lot_bom = df_bom.copy()
-                            if lot_bom_project and lot_bom_project != "-- All --":
-                                p_col = bom_proj_name_col or bom_proj_num_col
-                                if p_col:
-                                    df_lot_bom = df_lot_bom[df_lot_bom[p_col] == lot_bom_project]
-                            if lot_wo_list != ["-- All --"] and bom_wo_col:
-                                df_lot_bom = df_lot_bom[df_lot_bom[bom_wo_col].astype(str).isin(lot_wo_list)]
-                            if lot_item_list != ["-- All --"] and bom_item_col:
-                                df_lot_bom = df_lot_bom[df_lot_bom[bom_item_col].astype(str).isin(lot_item_list)]
+                        # Reconstruct BOM for this lot
+                        lot_bom_project = lot_info.get("project", "")
+                        lot_wo_list = lot_info.get("work_orders", ["-- All --"])
+                        lot_item_list = lot_info.get("items", ["-- All --"])
 
-                            if not df_lot_bom.empty and bom_comp_code_col and bom_open_qty_col:
-                                grp = [bom_comp_code_col]
-                                if bom_comp_desc_col: grp.append(bom_comp_desc_col)
-                                lot_comp = df_lot_bom.groupby(grp, dropna=False).agg(Open_Qty=(bom_open_qty_col, "sum")).reset_index()
-                                lot_comp = lot_comp.merge(stock_agg, left_on=bom_comp_code_col, right_on="_stk_item", how="left")
-                                lot_comp["_stk_total_onhand"] = lot_comp["_stk_total_onhand"].fillna(0)
-                                lot_comp["Gap"] = lot_comp["_stk_total_onhand"] - lot_comp["Open_Qty"]
-                                lot_comp.rename(columns={"_stk_total_onhand": "Stock"}, inplace=True)
-                                lot_comp.drop(columns=["_stk_item"], errors="ignore", inplace=True)
-                                lot_comp = lot_comp.sort_values("Gap", ascending=True)
-                                st.dataframe(lot_comp, use_container_width=True, height=300)
-                            else:
-                                st.caption("No matching BOM data for this lot.")
+                        df_lot_bom = df_bom.copy()
+                        if lot_bom_project and lot_bom_project != "-- All --":
+                            p_col = bom_proj_name_col or bom_proj_num_col
+                            if p_col:
+                                df_lot_bom = df_lot_bom[df_lot_bom[p_col] == lot_bom_project]
+                        if lot_wo_list != ["-- All --"] and bom_wo_col:
+                            df_lot_bom = df_lot_bom[df_lot_bom[bom_wo_col].astype(str).isin(lot_wo_list)]
+                        if lot_item_list != ["-- All --"] and bom_item_col:
+                            df_lot_bom = df_lot_bom[df_lot_bom[bom_item_col].astype(str).isin(lot_item_list)]
+
+                        if not df_lot_bom.empty and bom_comp_code_col and bom_open_qty_col:
+                            grp = [bom_comp_code_col]
+                            if bom_comp_desc_col: grp.append(bom_comp_desc_col)
+                            lot_comp = df_lot_bom.groupby(grp, dropna=False).agg(Open_Qty=(bom_open_qty_col, "sum")).reset_index()
+                            lot_comp = lot_comp.merge(stock_agg, left_on=bom_comp_code_col, right_on="_stk_item", how="left")
+                            lot_comp["_stk_total_onhand"] = lot_comp["_stk_total_onhand"].fillna(0)
+                            lot_comp["Gap"] = lot_comp["_stk_total_onhand"] - lot_comp["Open_Qty"]
+                            lot_comp.rename(columns={"_stk_total_onhand": "Stock"}, inplace=True)
+                            lot_comp.drop(columns=["_stk_item"], errors="ignore", inplace=True)
+                            lot_comp = lot_comp.sort_values("Gap", ascending=True)
+                            st.dataframe(lot_comp, use_container_width=True, height=300)
+                        else:
+                            st.caption("No matching BOM data for this lot.")
 
 
 # ═══════════════════════════════════════════════════
-# TAB 4 – SHORTAGE FORECAST
+# TAB 4 – SHORTAGE FORECAST (Priority-based Stock Allocation)
 # ═══════════════════════════════════════════════════
 with tab_shortage:
-    st.markdown('<div class="section-header">Material Shortage Forecast Report</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">Priority-Based Material Shortage Forecast (Project + Lot)</div>', unsafe_allow_html=True)
+    st.caption("Stock is allocated to projects in order of Assembly Start Date. Earlier projects get stock first; later projects see what remains.")
 
-    if bom_comp_code_col and bom_open_qty_col and bom_proj_name_col:
-        # Use raw BOM project names directly — no matched/normalised column
-        group_cols = list(dict.fromkeys([c for c in [bom_proj_name_col, bom_comp_code_col, bom_comp_desc_col] if c]))
-        proj_comp = df_bom.groupby(group_cols, dropna=False).agg(
-            Required=(bom_req_qty_col, "sum") if bom_req_qty_col else (bom_open_qty_col, "sum"),
-            Open=(bom_open_qty_col, "sum"),
-            Issued=(bom_issued_qty_col, "sum") if bom_issued_qty_col else (bom_open_qty_col, lambda x: 0),
-        ).reset_index()
+    row_lot_assignments = load_row_lot_assignments()
+    saved_lots = load_saved_lots()
 
-        proj_comp = proj_comp.merge(stock_agg, left_on=bom_comp_code_col, right_on="_stk_item", how="left")
-        proj_comp["_stk_total_onhand"] = proj_comp["_stk_total_onhand"].fillna(0)
-        proj_comp["Gap"] = proj_comp["_stk_total_onhand"] - proj_comp["Open"]
-        proj_comp.rename(columns={"_stk_total_onhand": "Stock_Available"}, inplace=True)
-        proj_comp.drop(columns=["_stk_item"], errors="ignore", inplace=True)
-        proj_comp["Risk"] = proj_comp["Gap"].apply(lambda g: "🔴 Critical" if g < -50 else ("🟡 Warning" if g < 0 else "🟢 OK"))
+    if bom_comp_code_col and bom_open_qty_col:
+        # ── Step 1: Build priority-ordered list of (row_key, lot_name, assembly_start_date) ──
+        priority_rows = []
+        for idx, row in df_fc.iterrows():
+            rk = row["_row_key"]
+            pname = str(row.get(fc_proj_name_col, "")).strip() if pd.notna(row.get(fc_proj_name_col)) else "Unknown"
+            asm_date = row.get(fc_asm_start_col) if fc_asm_start_col else None
+            bp = str(row.get(fc_build_period_col, "")).strip() if fc_build_period_col and pd.notna(row.get(fc_build_period_col)) else ""
 
-        # Join schedule dates using raw BOM project name matched to forecasting sheet project name
-        if fc_proj_name_col and fc_need_by_col:
-            schedule = df_fc[[fc_proj_name_col, fc_need_by_col]].drop_duplicates(subset=[fc_proj_name_col])
-            schedule.rename(columns={fc_proj_name_col: bom_proj_name_col, fc_need_by_col: "Need_By_Date"}, inplace=True)
-            proj_comp = proj_comp.merge(schedule, on=bom_proj_name_col, how="left")
-        if fc_proj_name_col and fc_asm_start_col:
-            asm = df_fc[[fc_proj_name_col, fc_asm_start_col]].drop_duplicates(subset=[fc_proj_name_col])
-            asm.rename(columns={fc_proj_name_col: bom_proj_name_col, fc_asm_start_col: "Assembly_Start"}, inplace=True)
-            proj_comp = proj_comp.merge(asm, on=bom_proj_name_col, how="left")
+            assigned_lots = [l for l in row_lot_assignments.get(rk, []) if l in saved_lots]
+            if not assigned_lots:
+                continue
 
-        f1, f2, f3 = st.columns(3)
-        with f1: risk_filter = st.multiselect("Risk Level", ["🔴 Critical", "🟡 Warning", "🟢 OK"], default=["🔴 Critical", "🟡 Warning"], key="risk_flt")
-        with f2: proj_flt = st.multiselect("Projects", sorted(proj_comp[bom_proj_name_col].dropna().unique().tolist()), key="proj_flt")
-        with f3: search_comp = st.text_input("Search Component", key="shortage_search")
+            for lot_nm in assigned_lots:
+                priority_rows.append({
+                    "row_key": rk,
+                    "project": pname,
+                    "lot": lot_nm,
+                    "build_period": bp,
+                    "asm_date": asm_date,
+                    "asm_date_sort": asm_date if pd.notna(asm_date) else pd.Timestamp("2099-12-31"),
+                })
 
-        display_short = proj_comp[proj_comp["Risk"].isin(risk_filter)].copy()
-        if proj_flt: display_short = display_short[display_short[bom_proj_name_col].isin(proj_flt)]
-        if search_comp:
-            mask = pd.Series([False] * len(display_short))
-            if bom_comp_code_col: mask |= display_short[bom_comp_code_col].astype(str).str.contains(search_comp, case=False, na=False)
-            if bom_comp_desc_col: mask |= display_short[bom_comp_desc_col].astype(str).str.contains(search_comp, case=False, na=False)
-            display_short = display_short[mask]
-        display_short = display_short.sort_values("Gap", ascending=True)
+        if not priority_rows:
+            st.info("ℹ️  No lots assigned to forecasting rows yet. Assign lots in the **Forecasting** tab first.")
+        else:
+            priority_df = pd.DataFrame(priority_rows).sort_values("asm_date_sort").reset_index(drop=True)
 
-        mc1, mc2, mc3 = st.columns(3)
-        with mc1: render_metric("Critical", len(display_short[display_short["Risk"] == "🔴 Critical"]), "red")
-        with mc2: render_metric("Warning", len(display_short[display_short["Risk"] == "🟡 Warning"]), "amber")
-        with mc3: render_metric("OK", len(proj_comp[proj_comp["Risk"] == "🟢 OK"]), "emerald")
+            # ── Step 2: For each project+lot in priority order, compute BOM demand and allocate stock ──
+            # Track remaining stock globally
+            remaining_stock = stock_agg.set_index("_stk_item")["_stk_total_onhand"].to_dict()
 
-        st.dataframe(display_short, use_container_width=True, height=500)
+            all_shortage_rows = []
 
-        st.markdown('<div class="section-header">Project Risk Heatmap</div>', unsafe_allow_html=True)
-        risk_summary = proj_comp.groupby(bom_proj_name_col, dropna=False).agg(
-            Critical=("Risk", lambda x: (x == "🔴 Critical").sum()),
-            Warning=("Risk", lambda x: (x == "🟡 Warning").sum()),
-            OK=("Risk", lambda x: (x == "🟢 OK").sum()),
-        ).reset_index().sort_values("Critical", ascending=False)
+            for _, prow in priority_df.iterrows():
+                lot_nm = prow["lot"]
+                lot_info = saved_lots.get(lot_nm, {})
+                if not lot_info:
+                    continue
 
-        fig_heat = go.Figure()
-        fig_heat.add_trace(go.Bar(y=risk_summary[bom_proj_name_col], x=risk_summary["Critical"], name="Critical", marker_color="#ef4444", orientation="h"))
-        fig_heat.add_trace(go.Bar(y=risk_summary[bom_proj_name_col], x=risk_summary["Warning"], name="Warning", marker_color="#f59e0b", orientation="h"))
-        fig_heat.add_trace(go.Bar(y=risk_summary[bom_proj_name_col], x=risk_summary["OK"], name="OK", marker_color="#10b981", orientation="h"))
-        fig_heat.update_layout(barmode="stack", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#94a3b8"), height=max(300, len(risk_summary) * 30), margin=dict(l=10, r=10, t=10, b=30), legend=dict(orientation="h", yanchor="bottom", y=-0.15))
-        st.plotly_chart(fig_heat, use_container_width=True)
+                # Get BOM for this lot
+                lot_bom_project = lot_info.get("project", "")
+                lot_wo_list = lot_info.get("work_orders", ["-- All --"])
+                lot_item_list = lot_info.get("items", ["-- All --"])
 
-        st.markdown("---")
-        st.download_button("⬇️ Download Shortage Report (CSV)", data=display_short.to_csv(index=False).encode("utf-8"), file_name=f"shortage_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+                df_lot_bom = df_bom.copy()
+                if lot_bom_project and lot_bom_project != "-- All --":
+                    p_col = bom_proj_name_col or bom_proj_num_col
+                    if p_col:
+                        df_lot_bom = df_lot_bom[df_lot_bom[p_col] == lot_bom_project]
+                if lot_wo_list != ["-- All --"] and bom_wo_col:
+                    df_lot_bom = df_lot_bom[df_lot_bom[bom_wo_col].astype(str).isin(lot_wo_list)]
+                if lot_item_list != ["-- All --"] and bom_item_col:
+                    df_lot_bom = df_lot_bom[df_lot_bom[bom_item_col].astype(str).isin(lot_item_list)]
+
+                if df_lot_bom.empty or not bom_comp_code_col:
+                    continue
+
+                # Aggregate demand per component
+                grp = [bom_comp_code_col]
+                if bom_comp_desc_col:
+                    grp.append(bom_comp_desc_col)
+
+                agg_dict = {bom_open_qty_col: "sum"}
+                if bom_req_qty_col:
+                    agg_dict[bom_req_qty_col] = "sum"
+
+                lot_demand = df_lot_bom.groupby(grp, dropna=False).agg(agg_dict).reset_index()
+
+                for _, comp_row in lot_demand.iterrows():
+                    comp_code = comp_row[bom_comp_code_col]
+                    comp_desc = comp_row.get(bom_comp_desc_col, "") if bom_comp_desc_col else ""
+                    open_qty = comp_row[bom_open_qty_col]
+                    req_qty = comp_row.get(bom_req_qty_col, open_qty) if bom_req_qty_col else open_qty
+
+                    # Check available stock for this component
+                    available = remaining_stock.get(comp_code, 0)
+                    allocated = min(available, open_qty)
+                    shortage = open_qty - allocated
+
+                    # Deduct allocated stock
+                    remaining_stock[comp_code] = available - allocated
+
+                    risk = "🔴 Critical" if shortage > 50 else ("🟡 Warning" if shortage > 0 else "🟢 OK")
+
+                    all_shortage_rows.append({
+                        "Project": prow["project"],
+                        "Lot": lot_nm,
+                        "Build Period": prow["build_period"],
+                        "Assembly Start": prow["asm_date"].strftime("%d-%b-%Y") if pd.notna(prow["asm_date"]) and isinstance(prow["asm_date"], pd.Timestamp) else "N/A",
+                        "Component Code": comp_code,
+                        "Component Desc": comp_desc,
+                        "Required": int(req_qty),
+                        "Open Qty": int(open_qty),
+                        "Stock Available (Before)": int(available),
+                        "Allocated": int(allocated),
+                        "Shortage": int(shortage),
+                        "Stock Remaining (After)": int(remaining_stock.get(comp_code, 0)),
+                        "Risk": risk,
+                        "_asm_sort": prow["asm_date_sort"],
+                    })
+
+            if all_shortage_rows:
+                shortage_df = pd.DataFrame(all_shortage_rows)
+                shortage_df = shortage_df.sort_values(["_asm_sort", "Project", "Lot", "Shortage"], ascending=[True, True, True, True])
+                shortage_display = shortage_df.drop(columns=["_asm_sort"])
+
+                # Filters
+                f1, f2, f3 = st.columns(3)
+                with f1:
+                    risk_filter = st.multiselect("Risk Level", ["🔴 Critical", "🟡 Warning", "🟢 OK"],
+                                                 default=["🔴 Critical", "🟡 Warning"], key="risk_flt")
+                with f2:
+                    proj_options = sorted(shortage_display["Project"].unique().tolist())
+                    proj_flt = st.multiselect("Projects", proj_options, key="proj_flt")
+                with f3:
+                    lot_flt = st.multiselect("Lots", sorted(shortage_display["Lot"].unique().tolist()), key="lot_flt")
+
+                filtered = shortage_display[shortage_display["Risk"].isin(risk_filter)].copy()
+                if proj_flt:
+                    filtered = filtered[filtered["Project"].isin(proj_flt)]
+                if lot_flt:
+                    filtered = filtered[filtered["Lot"].isin(lot_flt)]
+
+                # Metrics
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                with mc1:
+                    render_metric("Critical", len(filtered[filtered["Risk"] == "🔴 Critical"]), "red")
+                with mc2:
+                    render_metric("Warning", len(filtered[filtered["Risk"] == "🟡 Warning"]), "amber")
+                with mc3:
+                    render_metric("OK", len(shortage_display[shortage_display["Risk"] == "🟢 OK"]), "emerald")
+                with mc4:
+                    render_metric("Total Shortage Qty", int(filtered["Shortage"].sum()), "purple")
+
+                st.dataframe(filtered, use_container_width=True, height=500)
+
+                # Project + Lot Risk Heatmap
+                st.markdown('<div class="section-header">Project + Lot Risk Heatmap</div>', unsafe_allow_html=True)
+                risk_summary = shortage_display.copy()
+                risk_summary["Proj_Lot"] = risk_summary["Project"] + " → " + risk_summary["Lot"]
+                risk_heatmap = risk_summary.groupby("Proj_Lot").agg(
+                    Critical=("Risk", lambda x: (x == "🔴 Critical").sum()),
+                    Warning=("Risk", lambda x: (x == "🟡 Warning").sum()),
+                    OK=("Risk", lambda x: (x == "🟢 OK").sum()),
+                ).reset_index().sort_values("Critical", ascending=False)
+
+                fig_heat = go.Figure()
+                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["Critical"], name="Critical", marker_color="#ef4444", orientation="h"))
+                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["Warning"], name="Warning", marker_color="#f59e0b", orientation="h"))
+                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["OK"], name="OK", marker_color="#10b981", orientation="h"))
+                fig_heat.update_layout(barmode="stack", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#94a3b8"), height=max(300, len(risk_heatmap) * 35),
+                    margin=dict(l=10, r=10, t=10, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.15))
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+                st.markdown("---")
+                st.download_button("⬇️ Download Priority Shortage Report (CSV)",
+                    data=filtered.to_csv(index=False).encode("utf-8"),
+                    file_name=f"priority_shortage_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv")
+            else:
+                st.info("No component data found for the assigned lots.")
     else:
         st.warning("Required columns not found for shortage analysis.")
 
 
 # ═══════════════════════════════════════════════════
-# TAB 5 – TIMELINE
+# TAB 5 – TIMELINE (with Project + Lot Schedule)
 # ═══════════════════════════════════════════════════
 with tab_timeline:
     st.markdown('<div class="section-header">Project Schedule Timeline</div>', unsafe_allow_html=True)
 
     if fc_proj_name_col:
+        # ── Data labels toggle ──
+        show_data_labels = st.checkbox("📌 Show date labels on chart", value=False, key="tl_data_labels")
+
         timeline_rows = []
         for _, row in df_fc.iterrows():
             pname = row.get(fc_proj_name_col, "Unknown")
@@ -1127,10 +1274,154 @@ with tab_timeline:
                 height=max(400, len(tl_df["Project"].unique()) * 40), margin=dict(l=10, r=10, t=10, b=30),
                 legend=dict(orientation="h", yanchor="bottom", y=-0.15), xaxis_title="", yaxis_title="")
             fig_tl.update_yaxes(autorange="reversed")
+
+            # Add data labels if checkbox is checked
+            if show_data_labels:
+                for trace in fig_tl.data:
+                    if hasattr(trace, 'base') and trace.base is not None:
+                        start_labels = [pd.Timestamp(b).strftime("%d-%b") if pd.notna(b) else "" for b in trace.base]
+                        end_dates = []
+                        for b, x_val in zip(trace.base, trace.x):
+                            try:
+                                # x is duration in ms for timeline
+                                end_dt = pd.Timestamp(b) + pd.Timedelta(milliseconds=x_val)
+                                end_dates.append(end_dt.strftime("%d-%b"))
+                            except Exception:
+                                end_dates.append("")
+                        text_labels = [f"{s} → {e}" for s, e in zip(start_labels, end_dates)]
+                        trace.text = text_labels
+                        trace.textposition = "inside"
+                        trace.textfont = dict(size=9, color="white")
+
             st.plotly_chart(fig_tl, use_container_width=True)
         else:
             st.info("No date data available to build timeline.")
 
+        # ─────────────────────────────────────────────────
+        # NEW: Projects + Assigned Lots Schedule
+        # ─────────────────────────────────────────────────
+        st.markdown('<div class="section-header">📦 Projects + Assigned Lots Schedule (by Assembly Start Date)</div>', unsafe_allow_html=True)
+        st.caption("Only projects with assigned lots are shown, sorted by Assembly Start Date.")
+
+        row_lot_assignments = load_row_lot_assignments()
+        saved_lots = load_saved_lots()
+
+        lot_schedule_rows = []
+        for idx, row in df_fc.iterrows():
+            rk = row.get("_row_key", "")
+            assigned = [l for l in row_lot_assignments.get(rk, []) if l in saved_lots]
+            if not assigned:
+                continue
+
+            pname = str(row.get(fc_proj_name_col, "Unknown")).strip() if pd.notna(row.get(fc_proj_name_col)) else "Unknown"
+            asm_start = row.get(fc_asm_start_col) if fc_asm_start_col else None
+            asm_end = row.get(fc_asm_end_col) if fc_asm_end_col else None
+            need_by = row.get(fc_need_by_col) if fc_need_by_col else None
+            bp = str(row.get(fc_build_period_col, "")).strip() if fc_build_period_col and pd.notna(row.get(fc_build_period_col)) else ""
+            status = str(row.get(fc_status_col, "")).strip() if fc_status_col and pd.notna(row.get(fc_status_col)) else ""
+            cab_qty = row.get(fc_cab_qty_col, 0) if fc_cab_qty_col else 0
+
+            for lot_nm in assigned:
+                lot_info = saved_lots.get(lot_nm, {})
+                lot_schedule_rows.append({
+                    "Project": pname,
+                    "Build Period": bp,
+                    "Assembly Start": asm_start,
+                    "Assembly End": asm_end,
+                    "Need By Date": need_by,
+                    "Status": status,
+                    "Cabinets": int(cab_qty) if pd.notna(cab_qty) else 0,
+                    "Assigned Lot": lot_nm,
+                    "Lot BOM Project": lot_info.get("project", "N/A"),
+                    "Lot Components": lot_info.get("component_count", 0),
+                    "Lot Short": lot_info.get("short_components", 0),
+                    "Lot Open Qty": lot_info.get("total_open_qty", 0),
+                    "_asm_sort": asm_start if pd.notna(asm_start) else pd.Timestamp("2099-12-31"),
+                })
+
+        if lot_schedule_rows:
+            lot_sched_df = pd.DataFrame(lot_schedule_rows)
+            lot_sched_df = lot_sched_df.sort_values("_asm_sort").reset_index(drop=True)
+
+            # Format dates for display
+            lot_sched_display = lot_sched_df.drop(columns=["_asm_sort"]).copy()
+            for dcol in ["Assembly Start", "Assembly End", "Need By Date"]:
+                if dcol in lot_sched_display.columns:
+                    lot_sched_display[dcol] = pd.to_datetime(lot_sched_display[dcol], errors="coerce").dt.strftime("%d-%b-%Y").fillna("")
+
+            # Summary metrics
+            lm1, lm2, lm3, lm4 = st.columns(4)
+            with lm1:
+                render_metric("Projects with Lots", lot_sched_display["Project"].nunique(), "blue")
+            with lm2:
+                render_metric("Total Lots Assigned", len(lot_sched_display), "purple")
+            with lm3:
+                render_metric("Total Short Components", int(lot_sched_display["Lot Short"].sum()), "red")
+            with lm4:
+                render_metric("Total Lot Open Qty", int(lot_sched_display["Lot Open Qty"].sum()), "amber")
+
+            st.dataframe(lot_sched_display, use_container_width=True, height=400)
+
+            # Gantt chart for lot schedule
+            gantt_rows = []
+            for _, lrow in lot_sched_df.iterrows():
+                asm_s = lrow["Assembly Start"]
+                asm_e = lrow["Assembly End"]
+                if pd.notna(asm_s):
+                    end = asm_e if pd.notna(asm_e) else (asm_s + timedelta(days=7))
+                    gantt_rows.append({
+                        "Label": f"{lrow['Project']} → {lrow['Assigned Lot']}",
+                        "Phase": "Assembly",
+                        "Start": asm_s,
+                        "End": end,
+                    })
+                nbd = lrow["Need By Date"]
+                if pd.notna(nbd):
+                    gantt_rows.append({
+                        "Label": f"{lrow['Project']} → {lrow['Assigned Lot']}",
+                        "Phase": "Shipment",
+                        "Start": nbd,
+                        "End": nbd + timedelta(days=3),
+                    })
+
+            if gantt_rows:
+                gantt_df = pd.DataFrame(gantt_rows)
+                gantt_df["Start"] = pd.to_datetime(gantt_df["Start"], errors="coerce")
+                gantt_df["End"] = pd.to_datetime(gantt_df["End"], errors="coerce")
+                gantt_df = gantt_df.dropna(subset=["Start", "End"])
+
+                fig_lot_tl = px.timeline(gantt_df, x_start="Start", x_end="End", y="Label", color="Phase",
+                    color_discrete_map={"Assembly": "#3b82f6", "Shipment": "#f59e0b"})
+                fig_lot_tl.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#94a3b8"),
+                    height=max(350, len(gantt_df["Label"].unique()) * 45),
+                    margin=dict(l=10, r=10, t=10, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.15),
+                    xaxis_title="", yaxis_title="")
+                fig_lot_tl.update_yaxes(autorange="reversed")
+
+                # Data labels on lot schedule gantt
+                if show_data_labels:
+                    for trace in fig_lot_tl.data:
+                        if hasattr(trace, 'base') and trace.base is not None:
+                            start_labels = [pd.Timestamp(b).strftime("%d-%b") if pd.notna(b) else "" for b in trace.base]
+                            end_dates = []
+                            for b, x_val in zip(trace.base, trace.x):
+                                try:
+                                    end_dt = pd.Timestamp(b) + pd.Timedelta(milliseconds=x_val)
+                                    end_dates.append(end_dt.strftime("%d-%b"))
+                                except Exception:
+                                    end_dates.append("")
+                            text_labels = [f"{s} → {e}" for s, e in zip(start_labels, end_dates)]
+                            trace.text = text_labels
+                            trace.textposition = "inside"
+                            trace.textfont = dict(size=9, color="white")
+
+                st.plotly_chart(fig_lot_tl, use_container_width=True)
+        else:
+            st.info("No lots assigned to any forecasting rows yet. Assign lots in the Forecasting tab.")
+
+        # ── Upcoming Deadlines ──
         st.markdown('<div class="section-header">Upcoming Deadlines (Next 60 Days)</div>', unsafe_allow_html=True)
         today = pd.Timestamp.now().normalize()
         cutoff = today + timedelta(days=60)
@@ -1158,7 +1449,8 @@ with tab_raw:
     raw_tab1, raw_tab2, raw_tab3 = st.tabs(["Forecasting", "Open Orders BOM", "Stock"])
     with raw_tab1:
         st.markdown(f"**Rows:** {len(df_fc)}  |  **Columns:** {len(df_fc.columns)}")
-        st.dataframe(df_fc, use_container_width=True, height=500)
+        display_fc_raw = df_fc.drop(columns=["_row_key", "_row_label"], errors="ignore")
+        st.dataframe(display_fc_raw, use_container_width=True, height=500)
     with raw_tab2:
         st.markdown(f"**Rows:** {len(df_bom)}  |  **Columns:** {len(df_bom.columns)}")
         st.dataframe(df_bom, use_container_width=True, height=500)
