@@ -138,7 +138,26 @@ st.markdown("""
 def load_saved_lots() -> dict:
     if os.path.exists(SAVED_LOTS_FILE):
         with open(SAVED_LOTS_FILE, "r") as f:
-            return json.load(f)
+            raw_lots = json.load(f)
+
+        normalized_lots = {}
+        changed = False
+        for lot_name, lot_info in raw_lots.items():
+            if not isinstance(lot_info, dict):
+                changed = True
+                continue
+            project_name = str(lot_info.get("project_name", lot_info.get("project", ""))).strip()
+            row_number = str(lot_info.get("row_number", lot_info.get("rom_number", ""))).strip()
+            normalized_lots[str(lot_name).strip()] = {
+                "project_name": project_name,
+                "row_number": row_number,
+            }
+            if lot_info != normalized_lots[str(lot_name).strip()]:
+                changed = True
+
+        if changed:
+            save_lots(normalized_lots)
+        return normalized_lots
     return {}
 
 
@@ -147,11 +166,209 @@ def save_lots(lots: dict):
         json.dump(lots, f, indent=2, default=str)
 
 
+def get_lot_project_name(lot_info: dict) -> str:
+    if not isinstance(lot_info, dict):
+        return ""
+    return str(lot_info.get("project_name", lot_info.get("project", ""))).strip()
+
+
+def get_lot_row_number(lot_info: dict) -> str:
+    if not isinstance(lot_info, dict):
+        return ""
+    return str(lot_info.get("row_number", lot_info.get("rom_number", ""))).strip()
+
+
+def get_lot_bom_scope(df_bom_input: pd.DataFrame, lot_info: dict, proj_name_col: str | None, proj_num_col: str | None) -> pd.DataFrame:
+    lot_bom_project = get_lot_project_name(lot_info)
+    df_lot_bom = df_bom_input.copy()
+    if lot_bom_project and lot_bom_project != "-- All --":
+        p_col = proj_name_col or proj_num_col
+        if p_col and p_col in df_lot_bom.columns:
+            df_lot_bom = df_lot_bom[df_lot_bom[p_col].astype(str).str.strip() == lot_bom_project]
+    return df_lot_bom
+
+
+def compute_lot_metrics(df_bom_input: pd.DataFrame, lot_info: dict) -> dict:
+    scoped_bom = get_lot_bom_scope(df_bom_input, lot_info, bom_proj_name_col, bom_proj_num_col)
+    if scoped_bom.empty:
+        return {"component_count": 0, "short_components": 0, "total_open_qty": 0}
+    if not bom_comp_code_col or not bom_open_qty_col or bom_comp_code_col not in scoped_bom.columns or bom_open_qty_col not in scoped_bom.columns:
+        return {"component_count": 0, "short_components": 0, "total_open_qty": 0}
+
+    grp = [bom_comp_code_col]
+    if bom_comp_desc_col and bom_comp_desc_col in scoped_bom.columns:
+        grp.append(bom_comp_desc_col)
+    lot_comp = scoped_bom.groupby(grp, dropna=False).agg(
+        Open_Qty=(bom_open_qty_col, "sum"),
+        Total_Available=("_total_available", "max"),
+    ).reset_index()
+    lot_comp["Gap"] = lot_comp["Total_Available"] - lot_comp["Open_Qty"]
+
+    return {
+        "component_count": int(len(lot_comp)),
+        "short_components": int((lot_comp["Gap"] < 0).sum()),
+        "total_open_qty": int(lot_comp["Open_Qty"].sum()),
+    }
+
+
+def _first_non_empty(series: pd.Series):
+    non_empty = series.dropna().astype(str).map(str.strip)
+    non_empty = non_empty[non_empty != ""]
+    if non_empty.empty:
+        return None
+    return non_empty.iloc[0]
+
+
+def build_po_overview_dataframe(shortage_df_input: pd.DataFrame, df_bom_input: pd.DataFrame) -> pd.DataFrame:
+    if shortage_df_input.empty or not bom_comp_code_col:
+        return pd.DataFrame()
+
+    bom_scope = df_bom_input.copy()
+    bom_scope[bom_comp_code_col] = bom_scope[bom_comp_code_col].astype(str).str.strip()
+    bom_project_col = bom_proj_name_col or bom_proj_num_col
+    if bom_project_col and bom_project_col in bom_scope.columns:
+        bom_scope[bom_project_col] = bom_scope[bom_project_col].astype(str).str.strip()
+
+    for id_col in [bom_order_col, bom_wo_col, bom_cust_po_col]:
+        if id_col and id_col in bom_scope.columns:
+            bom_scope[id_col] = normalize_identifier_series(bom_scope[id_col])
+
+    po_rows = shortage_df_input.copy()
+    po_rows["Project"] = po_rows["Project"].astype(str).str.strip()
+    po_rows["Component Code"] = po_rows["Component Code"].astype(str).str.strip()
+
+    bom_match_rows = bom_scope.copy()
+    if bom_project_col and bom_project_col in bom_match_rows.columns and bom_project_col in po_rows.columns:
+        bom_match_rows[bom_project_col] = bom_match_rows[bom_project_col].astype(str).str.strip()
+
+    merge_left_keys = ["Component Code"]
+    merge_right_keys = [bom_comp_code_col]
+    if bom_project_col and bom_project_col in bom_match_rows.columns and bom_project_col in po_rows.columns:
+        merge_left_keys = ["Project", "Component Code"]
+        merge_right_keys = [bom_project_col, bom_comp_code_col]
+
+    merged = po_rows.merge(
+        bom_match_rows,
+        left_on=merge_left_keys,
+        right_on=merge_right_keys,
+        how="left",
+        suffixes=("", "_bom"),
+    )
+
+    if bom_incoming_po_col and bom_incoming_po_col in merged.columns:
+        merged["Incoming PO Quantity"] = pd.to_numeric(merged[bom_incoming_po_col], errors="coerce").fillna(0)
+    else:
+        merged["Incoming PO Quantity"] = 0
+
+    if bom_po_recv_col and bom_po_recv_col in merged.columns:
+        merged["PO in Receiving"] = pd.to_numeric(merged[bom_po_recv_col], errors="coerce").fillna(0)
+    else:
+        merged["PO in Receiving"] = 0
+
+    if bom_po_promise_col and bom_po_promise_col in merged.columns:
+        merged["PO Promise Date"] = pd.to_datetime(merged[bom_po_promise_col], errors="coerce")
+    else:
+        merged["PO Promise Date"] = pd.NaT
+
+    if bom_buyer_col and bom_buyer_col in merged.columns:
+        merged["Buyer Name"] = merged[bom_buyer_col].astype(str).str.strip().replace({"nan": "", "None": ""})
+    else:
+        merged["Buyer Name"] = ""
+
+    if bom_po_generated_col and bom_po_generated_col in merged.columns:
+        merged["PO Generated Raw"] = merged[bom_po_generated_col].astype(str).str.strip().replace({"nan": "", "None": ""})
+    else:
+        merged["PO Generated Raw"] = ""
+
+    if bom_wo_col and bom_wo_col in merged.columns:
+        merged.rename(columns={bom_wo_col: "Work Order Number"}, inplace=True)
+    else:
+        merged["Work Order Number"] = ""
+
+    if bom_order_col and bom_order_col in merged.columns:
+        merged.rename(columns={bom_order_col: "Order Number"}, inplace=True)
+    else:
+        merged["Order Number"] = ""
+
+    if bom_cust_po_col and bom_cust_po_col in merged.columns:
+        merged.rename(columns={bom_cust_po_col: "Customer PO"}, inplace=True)
+    else:
+        merged["Customer PO"] = ""
+
+    merged["PO Generated"] = merged.apply(
+        lambda row: "Yes" if (
+            str(row.get("PO Generated Raw", "")).strip() not in {"", "nan", "None"}
+            or pd.to_numeric(row.get("Incoming PO Quantity"), errors="coerce") > 0
+            or pd.to_numeric(row.get("PO in Receiving"), errors="coerce") > 0
+            or pd.notna(row.get("PO Promise Date"))
+        ) else "No",
+        axis=1,
+    )
+
+    def join_unique(values) -> str:
+        cleaned = []
+        for value in values:
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text in {"", "nan", "None"}:
+                continue
+            if text not in cleaned:
+                cleaned.append(text)
+        return ", ".join(cleaned)
+
+    club_keys = ["Project", "Lot", "PO Generated", "Buyer Name", "Incoming PO Quantity", "PO in Receiving", "PO Promise Date"]
+    club_keys = [column for column in club_keys if column in merged.columns]
+
+    club_agg = {}
+    if "Shortage" in merged.columns:
+        club_agg["Shortage"] = "sum"
+    if "Open Qty" in merged.columns:
+        club_agg["Open Qty"] = "sum"
+    if "Component Code" in merged.columns:
+        club_agg["Component Code"] = join_unique
+    if "Component Desc" in merged.columns:
+        club_agg["Component Desc"] = join_unique
+    if "Work Order Number" in merged.columns:
+        club_agg["Work Order Number"] = join_unique
+    if "Order Number" in merged.columns:
+        club_agg["Order Number"] = join_unique
+    if "Customer PO" in merged.columns:
+        club_agg["Customer PO"] = join_unique
+
+    if not club_keys or not club_agg:
+        display_cols = [
+            "Project", "Lot", "Component Code", "Component Desc", "Shortage", "Open Qty",
+            "Work Order Number", "Order Number", "Customer PO",
+            "PO Generated", "PO Promise Date", "Buyer Name", "Incoming PO Quantity", "PO in Receiving",
+        ]
+        existing_display_cols = [c for c in display_cols if c in merged.columns]
+        merged = merged[existing_display_cols].copy()
+        merged["PO Promise Date"] = pd.to_datetime(merged["PO Promise Date"], errors="coerce")
+        merged["Incoming PO Quantity"] = pd.to_numeric(merged["Incoming PO Quantity"], errors="coerce").fillna(0)
+        merged["PO in Receiving"] = pd.to_numeric(merged["PO in Receiving"], errors="coerce").fillna(0)
+        return merged
+
+    clubbed = merged.groupby(club_keys, dropna=False, as_index=False).agg(club_agg)
+    clubbed["Clubbed Rows"] = merged.groupby(club_keys, dropna=False).size().values
+
+    display_cols = [
+        "Project", "Lot", "PO Generated", "Buyer Name", "Incoming PO Quantity", "PO in Receiving",
+        "PO Promise Date", "Clubbed Rows", "Work Order Number", "Order Number", "Customer PO",
+        "Component Code", "Component Desc", "Shortage", "Open Qty",
+    ]
+    existing_display_cols = [c for c in display_cols if c in clubbed.columns]
+    clubbed = clubbed[existing_display_cols].copy()
+    clubbed["PO Promise Date"] = pd.to_datetime(clubbed["PO Promise Date"], errors="coerce")
+    clubbed["Incoming PO Quantity"] = pd.to_numeric(clubbed["Incoming PO Quantity"], errors="coerce").fillna(0)
+    clubbed["PO in Receiving"] = pd.to_numeric(clubbed["PO in Receiving"], errors="coerce").fillna(0)
+    return clubbed
+
+
 def robust_to_datetime(series: pd.Series) -> pd.Series:
     if series.dropna().empty:
         return pd.to_datetime(series, errors="coerce")
 
-    # Sample a small subset to find the best strategy, then apply once to full series
     sample = series.dropna().head(50)
     best_result_sample = None
     best_count = -1
@@ -169,7 +386,6 @@ def robust_to_datetime(series: pd.Series) -> pd.Series:
             best_kwargs = kwargs
             best_result_sample = result
 
-    # Try format="mixed" on the sample
     best_mixed_kwargs = None
     for dayfirst in [False, True]:
         try:
@@ -181,7 +397,6 @@ def robust_to_datetime(series: pd.Series) -> pd.Series:
         except Exception:
             pass
 
-    # Apply the winning strategy to the full series (single pass)
     if best_mixed_kwargs:
         try:
             return pd.to_datetime(series, errors="coerce", **best_mixed_kwargs)
@@ -192,6 +407,31 @@ def robust_to_datetime(series: pd.Series) -> pd.Series:
 
 def parse_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0)
+
+
+def normalize_identifier_series(series: pd.Series) -> pd.Series:
+    def _normalize_value(value):
+        if pd.isna(value):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.endswith(".0"):
+                maybe_int = text[:-2]
+                if maybe_int.isdigit():
+                    return maybe_int
+            return text
+        if isinstance(value, float):
+            return str(int(value)) if value.is_integer() else str(value)
+        if isinstance(value, int):
+            return str(value)
+        text = str(value).strip()
+        if text.endswith(".0"):
+            maybe_int = text[:-2]
+            if maybe_int.isdigit():
+                return maybe_int
+        return text
+
+    return series.map(_normalize_value)
 
 
 def render_metric(label: str, value, color_class: str = "blue"):
@@ -242,7 +482,6 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
         score = score_sheet_format(df_csv, expected_groups)
         return df_csv, "CSV", score, ["CSV"]
 
-    # Open the workbook ONCE via openpyxl in read_only mode for fast header sniffing
     from openpyxl import load_workbook
     try:
         wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
@@ -262,11 +501,10 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
     for sheet in sheet_names:
         try:
             ws = wb[sheet]
-            # Read only first 5 rows directly from openpyxl (very fast in read_only mode)
             raw_rows = []
             for i, row in enumerate(ws.iter_rows(values_only=True)):
                 raw_rows.append(list(row))
-                if i >= 4:  # 5 rows (0-4)
+                if i >= 4:
                     break
 
             if not raw_rows:
@@ -278,11 +516,9 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
             for header_row in [0, 1, 2]:
                 if header_row >= len(raw_rows):
                     break
-                # Build a mini dataframe with the header row as columns
                 header_vals = [str(c).strip().replace("\n", " ").replace("\r", " ") if c is not None else f"col_{j}" for j, c in enumerate(raw_rows[header_row])]
                 data_rows = raw_rows[header_row + 1:]
                 if data_rows:
-                    # Pad rows to same length as header
                     max_len = len(header_vals)
                     padded = [r + [None] * (max_len - len(r)) if len(r) < max_len else r[:max_len] for r in data_rows]
                     mini_df = pd.DataFrame(padded, columns=header_vals)
@@ -305,7 +541,6 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
         except Exception:
             continue
 
-    # Close read-only workbook
     try:
         wb.close()
     except Exception:
@@ -314,7 +549,6 @@ def read_upload_from_bytes(file_bytes, file_name, expected_alias_groups, preferr
     if best_sheet is None:
         return None, None, 0, sheet_names
 
-    # Single full read of the winning sheet only
     df_selected = clean_columns(pd.read_excel(
         BytesIO(file_bytes), sheet_name=best_sheet,
         header=best_header_row, engine="openpyxl"
@@ -368,9 +602,16 @@ BOM_SALES_STATUS = ["sales status"]
 BOM_TOTAL_AVAIL = ["total available", "total avail"]
 BOM_PO_RECEIVING = ["po in receiving", "po receiving"]
 BOM_SUPPLIER = ["supplier"]
+BOM_BUYER = ["buyer name", "buyer", "buyer id", "purchasing buyer", "po buyer"]
+BOM_PO_PROMISE = ["po promise date", "promise date", "promised date", "po promised date", "promised dt", "promise dt", "po promise"]
+BOM_PO_GENERATED = ["po generated", "po number", "po no", "purchase order", "po #", "po status"]
 BOM_JOB_START = ["job start date", "job start"]
 BOM_TOTAL_DEMAND = ["total demand"]
 BOM_NET_EXT_AVAIL = ["net extended available qty", "net extended avail"]
+
+LOT_NAME_ALIASES = ["lot", "lot name", "lot_name"]
+LOT_PROJECT_ALIASES = ["project", "project name", "project_name"]
+LOT_ROW_NUM_ALIASES = ["row number", "row no", "row", "rom number", "rom no", "rom nuber", "rom"]
 
 
 # ─────────────────────────────────────────────────
@@ -500,6 +741,9 @@ bom_cust_po_col = find_col(df_bom, BOM_CUST_PO)
 bom_sales_status_col = find_col(df_bom, BOM_SALES_STATUS)
 bom_po_recv_col = find_col(df_bom, BOM_PO_RECEIVING)
 bom_supplier_col = find_col(df_bom, BOM_SUPPLIER)
+bom_buyer_col = find_col(df_bom, BOM_BUYER)
+bom_po_promise_col = find_col(df_bom, BOM_PO_PROMISE)
+bom_po_generated_col = find_col(df_bom, BOM_PO_GENERATED)
 bom_job_start_col = find_col(df_bom, BOM_JOB_START)
 bom_total_demand_col = find_col(df_bom, BOM_TOTAL_DEMAND)
 bom_net_ext_col = find_col(df_bom, BOM_NET_EXT_AVAIL)
@@ -529,6 +773,14 @@ for dc in [bom_ship_col, bom_job_start_col]:
     if dc and dc in df_bom.columns:
         df_bom[dc] = robust_to_datetime(df_bom[dc])
 
+for dc in [bom_po_promise_col]:
+    if dc and dc in df_bom.columns:
+        df_bom[dc] = robust_to_datetime(df_bom[dc])
+
+for id_col in [bom_order_col, bom_wo_col, bom_cust_po_col]:
+    if id_col and id_col in df_bom.columns:
+        df_bom[id_col] = normalize_identifier_series(df_bom[id_col])
+
 
 # ─────────────────────────────────────────────────
 # COMPUTE TOTAL AVAILABLE FROM BOM (On Hand + Incoming PO + PO in Receiving)
@@ -538,6 +790,9 @@ _bom_po = df_bom[bom_incoming_po_col] if bom_incoming_po_col and bom_incoming_po
 _bom_po_recv = df_bom[bom_po_recv_col] if bom_po_recv_col and bom_po_recv_col in df_bom.columns else pd.Series(0, index=df_bom.index)
 df_bom["_total_available"] = _bom_oh + _bom_po + _bom_po_recv
 
+# On-Hand only column for the new table
+df_bom["_onhand_only"] = _bom_oh
+
 # Build stock_agg from BOM (component-level max total available)
 if bom_comp_code_col:
     stock_agg = (
@@ -545,8 +800,112 @@ if bom_comp_code_col:
         .max().reset_index()
         .rename(columns={bom_comp_code_col: "_stk_item", "_total_available": "_stk_total_onhand"})
     )
+    # On-Hand only stock aggregation
+    stock_agg_onhand_only = (
+        df_bom.groupby(bom_comp_code_col, dropna=False)["_onhand_only"]
+        .max().reset_index()
+        .rename(columns={bom_comp_code_col: "_stk_item", "_onhand_only": "_stk_total_onhand"})
+    )
 else:
     stock_agg = pd.DataFrame(columns=["_stk_item", "_stk_total_onhand"])
+    stock_agg_onhand_only = pd.DataFrame(columns=["_stk_item", "_stk_total_onhand"])
+
+
+def compute_priority_shortage_dataframe(df_fc_input, df_bom_input, saved_lots_map, row_lot_assignments_map, stock_agg_override=None):
+    """Compute sequentially allocated shortage rows used by multiple tabs.
+    
+    Args:
+        stock_agg_override: If provided, use this stock aggregation instead of the default.
+                           Used for On-Hand-Only allocation mode.
+    """
+    if not bom_comp_code_col or not bom_open_qty_col:
+        return pd.DataFrame()
+
+    priority_rows = []
+    for _, row in df_fc_input.iterrows():
+        rk = row.get("_row_key", "")
+        pname = str(row.get(fc_proj_name_col, "")).strip() if pd.notna(row.get(fc_proj_name_col)) else "Unknown"
+        asm_date = row.get(fc_asm_start_col) if fc_asm_start_col else None
+        bp = str(row.get(fc_build_period_col, "")).strip() if fc_build_period_col and pd.notna(row.get(fc_build_period_col)) else ""
+        assigned_lots = [l for l in row_lot_assignments_map.get(rk, []) if l in saved_lots_map]
+        if not assigned_lots:
+            continue
+        for lot_nm in assigned_lots:
+            priority_rows.append({
+                "row_key": rk,
+                "project": pname,
+                "lot": lot_nm,
+                "build_period": bp,
+                "asm_date": asm_date,
+                "asm_date_sort": asm_date if pd.notna(asm_date) else pd.Timestamp("2099-12-31"),
+            })
+
+    if not priority_rows:
+        return pd.DataFrame()
+
+    priority_df = pd.DataFrame(priority_rows).sort_values("asm_date_sort").reset_index(drop=True)
+    
+    # Use override stock if provided, otherwise use default
+    _stock_source = stock_agg_override if stock_agg_override is not None else stock_agg
+    remaining_stock = _stock_source.set_index("_stk_item")["_stk_total_onhand"].to_dict()
+    all_shortage_rows = []
+
+    for _, prow in priority_df.iterrows():
+        lot_nm = prow["lot"]
+        lot_info = saved_lots_map.get(lot_nm, {})
+        if not lot_info:
+            continue
+
+        df_lot_bom = get_lot_bom_scope(df_bom_input, lot_info, bom_proj_name_col, bom_proj_num_col)
+        if df_lot_bom.empty:
+            continue
+
+        grp = [bom_comp_code_col]
+        if bom_comp_desc_col:
+            grp.append(bom_comp_desc_col)
+
+        agg_dict = {bom_open_qty_col: "sum"}
+        if bom_req_qty_col:
+            agg_dict[bom_req_qty_col] = "sum"
+
+        lot_demand = df_lot_bom.groupby(grp, dropna=False).agg(agg_dict).reset_index()
+
+        for _, comp_row in lot_demand.iterrows():
+            comp_code = comp_row[bom_comp_code_col]
+            comp_desc = comp_row.get(bom_comp_desc_col, "") if bom_comp_desc_col else ""
+            open_qty = comp_row[bom_open_qty_col]
+            req_qty = comp_row.get(bom_req_qty_col, open_qty) if bom_req_qty_col else open_qty
+
+            available = remaining_stock.get(comp_code, 0)
+            allocated = min(available, open_qty)
+            shortage = open_qty - allocated
+            remaining_stock[comp_code] = available - allocated
+
+            risk = "🔴 Short" if shortage > 0 else "🟢 OK"
+            all_shortage_rows.append({
+                "Project": prow["project"],
+                "Lot": lot_nm,
+                "Build Period": prow["build_period"],
+                "Assembly Start": prow["asm_date"].strftime("%d-%b-%Y") if pd.notna(prow["asm_date"]) and isinstance(prow["asm_date"], pd.Timestamp) else "N/A",
+                "Assembly Start Date": prow["asm_date"],
+                "Component Code": comp_code,
+                "Component Desc": comp_desc,
+                "Required": int(req_qty),
+                "Open Qty": int(open_qty),
+                "Stock Available (Before)": int(available),
+                "Allocated": int(allocated),
+                "Shortage": int(shortage),
+                "Stock Remaining (After)": int(remaining_stock.get(comp_code, 0)),
+                "Risk": risk,
+                "_asm_sort": prow["asm_date_sort"],
+            })
+
+    if not all_shortage_rows:
+        return pd.DataFrame()
+
+    shortage_df = pd.DataFrame(all_shortage_rows)
+    shortage_df = shortage_df.sort_values(["_asm_sort", "Project", "Lot", "Shortage"], ascending=[True, True, True, True])
+    return shortage_df
 
 
 # ─────────────────────────────────────────────────
@@ -604,11 +963,11 @@ df_fc["_row_label"] = [
 
 
 # ─────────────────────────────────────────────────
-# TABS (no Overview tab)
+# TABS
 # ─────────────────────────────────────────────────
-tab_project, tab_forecasting, tab_shortage, tab_timeline, tab_raw = st.tabs([
+tab_project, tab_forecasting, tab_shortage, tab_analytics, tab_timeline = st.tabs([
     "🏗️ Project Drill-Down", "📈 Forecasting",
-    "🚨 Shortage Forecast", "📅 Timeline", "📋 Raw Data"
+    "🚨 Shortage Forecast", "📊 Lot & Project Analytics", "📅 Timeline"
 ])
 
 
@@ -659,14 +1018,12 @@ with tab_project:
 
     st.markdown('<div class="section-header">Component Detail</div>', unsafe_allow_html=True)
 
-    # Columns to show – EXCLUDED: Variance, Comp Make or Buy, Availability, Buyer, Mfg Lead Time, WO Status, original Total Available
     display_cols = [c for c in [
         bom_comp_code_col, bom_comp_desc_col, bom_req_qty_col, bom_issued_qty_col,
         bom_open_qty_col, bom_onhand_col, bom_incoming_po_col,
         bom_po_recv_col, bom_supplier_col
     ] if c is not None]
 
-    # Always include _total_available for computation
     display_cols_with_ta = list(dict.fromkeys(display_cols + ["_total_available"]))
 
     comp_detail = pd.DataFrame()
@@ -694,7 +1051,6 @@ with tab_project:
         else:
             comp_detail = comp_base.copy()
 
-        # Gap using _total_available
         if "_total_available" in comp_detail.columns and bom_open_qty_col and bom_open_qty_col in comp_detail.columns:
             comp_detail["Total Available vs Open Qty"] = comp_detail["_total_available"] - comp_detail[bom_open_qty_col]
 
@@ -718,35 +1074,115 @@ with tab_project:
                 render_metric("Total Required", int(comp_detail[bom_req_qty_col].sum()), "purple")
 
     st.markdown("---")
+    st.markdown("### 📥 Upload Lot Details (Excel/CSV)")
+    lot_upload_file = st.file_uploader("Upload Lot File", type=["xlsx", "xls", "xlsm", "csv"], key="lot_upload_file")
+    if lot_upload_file is not None:
+        lot_df, lot_sheet, lot_score, _ = read_upload(
+            lot_upload_file,
+            [LOT_NAME_ALIASES, LOT_PROJECT_ALIASES, LOT_ROW_NUM_ALIASES],
+            ["lot", "mapping", "details"],
+        )
+        if lot_df is None:
+            st.error("Unable to read lot upload file.")
+        else:
+            lot_name_col = find_col(lot_df, LOT_NAME_ALIASES)
+            lot_project_col = find_col(lot_df, LOT_PROJECT_ALIASES)
+            lot_row_col = find_col(lot_df, LOT_ROW_NUM_ALIASES)
+            st.caption(f"Detected sheet: {lot_sheet} ({lot_score}/3 key columns matched)")
+
+            if not lot_name_col or not lot_project_col:
+                st.error("Lot file must contain at least Lot Name and Project Name columns.")
+            else:
+                preview_cols = [c for c in [lot_name_col, lot_project_col, lot_row_col] if c]
+                st.dataframe(lot_df[preview_cols].head(20), use_container_width=True, height=250)
+
+                if st.button("Import Lots from File", key="import_lots_from_file"):
+                    saved_lots_current = load_saved_lots()
+                    imported_count = 0
+                    skipped_count = 0
+                    conflict_rows = []
+
+                    for idx, lot_row in lot_df.iterrows():
+                        lot_name_val = str(lot_row.get(lot_name_col, "")).strip() if pd.notna(lot_row.get(lot_name_col)) else ""
+                        project_val = str(lot_row.get(lot_project_col, "")).strip() if pd.notna(lot_row.get(lot_project_col)) else ""
+                        row_num_val = ""
+                        if lot_row_col and pd.notna(lot_row.get(lot_row_col)):
+                            row_num_val = str(lot_row.get(lot_row_col)).strip()
+
+                        if not lot_name_val or not project_val:
+                            skipped_count += 1
+                            continue
+
+                        has_conflict = False
+                        for existing_lot_name, existing_info in saved_lots_current.items():
+                            if existing_lot_name == lot_name_val:
+                                continue
+                            same_project = get_lot_project_name(existing_info) == project_val
+                            same_row = get_lot_row_number(existing_info) == row_num_val
+                            if same_project and row_num_val and same_row:
+                                has_conflict = True
+                                conflict_rows.append(f"Row {idx + 1}: {lot_name_val} conflicts with existing lot {existing_lot_name}")
+                                break
+
+                        if has_conflict:
+                            skipped_count += 1
+                            continue
+
+                        saved_lots_current[lot_name_val] = {
+                            "project_name": project_val,
+                            "row_number": row_num_val,
+                        }
+                        imported_count += 1
+
+                    save_lots(saved_lots_current)
+                    if imported_count:
+                        st.success(f"Imported/updated {imported_count} lot(s).")
+                    if skipped_count:
+                        st.warning(f"Skipped {skipped_count} row(s) due to missing data or conflicts.")
+                    if conflict_rows:
+                        st.caption("Conflicts: " + " | ".join(conflict_rows[:5]))
+                    st.rerun()
+
+    st.markdown("---")
     st.markdown("### 💾 Save Current Selection as Lot")
     lot_name = st.text_input("Lot Name", key="lot_name_input")
+    lot_row_number = st.text_input("ROW / ROM Number", key="lot_row_number_input")
     if st.button("Save Lot", type="primary", key="save_lot_btn"):
         if lot_name.strip():
-            lot_work_orders = selected_wos if selected_wos else ["-- All --"]
-            lot_items = selected_item_codes if selected_item_codes else ["-- All --"]
-            short_count = int((comp_detail["Total Available vs Open Qty"] < 0).sum()) if "Total Available vs Open Qty" in comp_detail.columns else 0
-            total_open = int(comp_detail[bom_open_qty_col].sum()) if bom_open_qty_col and bom_open_qty_col in comp_detail.columns else 0
-            total_req = int(comp_detail[bom_req_qty_col].sum()) if bom_req_qty_col and bom_req_qty_col in comp_detail.columns else 0
+            lot_name_clean = lot_name.strip()
+            lot_row_clean = lot_row_number.strip()
+            project_clean = str(selected_project).strip()
 
-            lot_info = {
-                "project": selected_project,
-                "work_orders": lot_work_orders,
-                "items": lot_items,
-                "item_labels": selected_item_labels if selected_item_labels else lot_items,
-                "work_order_count": scope_wo_count,
-                "item_count": scope_item_count,
-                "work_order": "All" if lot_work_orders == ["-- All --"] else ", ".join(lot_work_orders),
-                "item": "All" if lot_items == ["-- All --"] else ", ".join(lot_items),
-                "saved_at": datetime.now().isoformat(),
-                "component_count": len(comp_detail),
-                "short_components": short_count,
-                "total_open_qty": total_open,
-                "total_required_qty": total_req,
-            }
-            saved_lots[lot_name.strip()] = lot_info
-            save_lots(saved_lots)
-            st.success(f"Lot **{lot_name}** saved!")
-            st.rerun()
+            saved_lots_current = load_saved_lots()
+            validation_errors = []
+
+            if project_clean == "-- All --" or not project_clean:
+                validation_errors.append("❌ Select a specific Project before saving the lot.")
+            if not lot_row_clean:
+                validation_errors.append("❌ Enter ROW / ROM Number.")
+
+            for existing_lot_name, existing_lot_info in saved_lots_current.items():
+                if existing_lot_name == lot_name_clean:
+                    continue
+                same_project = get_lot_project_name(existing_lot_info) == project_clean
+                same_row = get_lot_row_number(existing_lot_info) == lot_row_clean
+                if same_project and same_row and lot_row_clean:
+                    validation_errors.append(
+                        f"❌ ROW / ROM Number **{lot_row_clean}** already exists for project **{project_clean}** in lot **{existing_lot_name}**"
+                    )
+                    break
+            
+            if validation_errors:
+                st.error("⚠️ **Cannot save lot due to conflicts:**\n\n" + "\n\n".join(validation_errors))
+            else:
+                lot_info = {
+                    "project_name": project_clean,
+                    "row_number": lot_row_clean,
+                }
+                saved_lots_current[lot_name_clean] = lot_info
+                save_lots(saved_lots_current)
+                st.success(f"✅ Lot **{lot_name_clean}** saved successfully!")
+                st.rerun()
         else:
             st.error("Enter a lot name.")
 
@@ -778,20 +1214,6 @@ with tab_forecasting:
             if col not in ["_row_key", "_row_label"] and pd.api.types.is_datetime64_any_dtype(fc_view[col]):
                 fc_view[col] = fc_view[col].dt.strftime("%d-%b-%Y").fillna("")
         fc_view = fc_view.dropna(how='all', subset=[c for c in fc_display_cols if c in fc_view.columns])
-
-        st.markdown('<div class="section-header">📊 Forecasting Data Summary</div>', unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
-        with m1: render_metric("Total Records", len(fc_view), "blue")
-        with m2:
-            if fc_cab_qty_col and fc_cab_qty_col in fc_view.columns:
-                total_cabs = pd.to_numeric(fc_view[fc_cab_qty_col], errors='coerce').sum()
-                render_metric("Total Cabinets", int(total_cabs) if not pd.isna(total_cabs) else "N/A", "purple")
-        with m3:
-            if fc_status_col and fc_status_col in fc_view.columns:
-                render_metric("Status Types", len(fc_view[fc_status_col].value_counts()), "emerald")
-        with m4:
-            if fc_type_col and fc_type_col in fc_view.columns:
-                render_metric("Forecast Types", len(fc_view[fc_type_col].value_counts()), "amber")
 
         # ── ROW-LEVEL Lot Assignment ──
         st.markdown('<div class="section-header">🔗 Assign Lots to Forecasting Schedule Rows</div>', unsafe_allow_html=True)
@@ -858,14 +1280,25 @@ with tab_forecasting:
 
         # ── Enrich table with lot info per row ──
         lot_col_assigned, lot_col_comp_count, lot_col_short, lot_col_open_qty = [], [], [], []
+        lot_metrics_cache = {}
         for _, row in fc_view.iterrows():
             rk = row["_row_key"]
             assigned = [l for l in row_lot_assignments.get(rk, []) if l in saved_lots]
             if assigned:
                 lot_col_assigned.append(", ".join(assigned))
-                lot_col_comp_count.append(sum(saved_lots[l].get("component_count", 0) for l in assigned))
-                lot_col_short.append(sum(saved_lots[l].get("short_components", 0) for l in assigned))
-                lot_col_open_qty.append(sum(saved_lots[l].get("total_open_qty", 0) for l in assigned))
+                comp_total = 0
+                short_total = 0
+                open_total = 0
+                for lot_name in assigned:
+                    if lot_name not in lot_metrics_cache:
+                        lot_metrics_cache[lot_name] = compute_lot_metrics(df_bom, saved_lots.get(lot_name, {}))
+                    metrics = lot_metrics_cache[lot_name]
+                    comp_total += metrics["component_count"]
+                    short_total += metrics["short_components"]
+                    open_total += metrics["total_open_qty"]
+                lot_col_comp_count.append(comp_total)
+                lot_col_short.append(short_total)
+                lot_col_open_qty.append(open_total)
             else:
                 lot_col_assigned.append("")
                 lot_col_comp_count.append(0)
@@ -904,14 +1337,6 @@ with tab_forecasting:
         if fc_search:
             fc_display = fc_display[fc_display[fc_proj_name_col].astype(str).str.contains(fc_search, case=False, na=False)]
 
-        m1, m2, m3, m4 = st.columns(4)
-        with m1: render_metric("Rows Shown", len(fc_display), "blue")
-        with m2: render_metric("With Lots", int((fc_display["Assigned Lots"] != "").sum()), "purple")
-        with m3: render_metric("Total Lot Shortages", int(fc_display["Lot Shortages"].sum()), "red")
-        with m4:
-            if fc_cab_qty_col and fc_cab_qty_col in fc_display.columns:
-                render_metric("Total Cabinets", int(parse_numeric(fc_display[fc_cab_qty_col]).sum()), "cyan")
-
         st.dataframe(fc_display.drop(columns=["_row_key", "_row_label"], errors="ignore"), use_container_width=True, height=550)
         st.caption(f"Showing {len(fc_display):,} of {len(fc_view):,} rows.")
 
@@ -929,25 +1354,15 @@ with tab_forecasting:
                     lot_info = saved_lots.get(lot_nm, {})
                     if not lot_info:
                         continue
+                    lot_metrics = compute_lot_metrics(df_bom, lot_info)
                     with st.expander(f"📦 Lot: **{lot_nm}**", expanded=True):
                         d1, d2, d3, d4 = st.columns(4)
-                        with d1: st.metric("BOM Project", lot_info.get("project", "N/A"))
-                        with d2: st.metric("Work Orders", lot_info.get("work_order_count", "N/A"))
-                        with d3: st.metric("Components", lot_info.get("component_count", 0))
-                        with d4: st.metric("Short", lot_info.get("short_components", 0))
+                        with d1: st.metric("Project", get_lot_project_name(lot_info) or "N/A")
+                        with d2: st.metric("ROW / ROM", get_lot_row_number(lot_info) or "N/A")
+                        with d3: st.metric("Components", lot_metrics["component_count"])
+                        with d4: st.metric("Short", lot_metrics["short_components"])
 
-                        lot_bom_project = lot_info.get("project", "")
-                        lot_wo_list = lot_info.get("work_orders", ["-- All --"])
-                        lot_item_list = lot_info.get("items", ["-- All --"])
-                        df_lot_bom = df_bom.copy()
-                        if lot_bom_project and lot_bom_project != "-- All --":
-                            p_col = bom_proj_name_col or bom_proj_num_col
-                            if p_col:
-                                df_lot_bom = df_lot_bom[df_lot_bom[p_col] == lot_bom_project]
-                        if lot_wo_list != ["-- All --"] and bom_wo_col:
-                            df_lot_bom = df_lot_bom[df_lot_bom[bom_wo_col].astype(str).isin(lot_wo_list)]
-                        if lot_item_list != ["-- All --"] and bom_item_col:
-                            df_lot_bom = df_lot_bom[df_lot_bom[bom_item_col].astype(str).isin(lot_item_list)]
+                        df_lot_bom = get_lot_bom_scope(df_bom, lot_info, bom_proj_name_col, bom_proj_num_col)
 
                         if not df_lot_bom.empty and bom_comp_code_col and bom_open_qty_col:
                             grp = [bom_comp_code_col]
@@ -963,212 +1378,540 @@ with tab_forecasting:
                         else:
                             st.caption("No matching BOM data for this lot.")
 
+        st.markdown('<div class="section-header">📆 Month-wise Schedule + Lot Assignment Analytics</div>', unsafe_allow_html=True)
+
+        if fc_asm_start_col and fc_asm_start_col in df_fc.columns:
+            month_rows = []
+            month_proj_lot_rows = []
+            for _, frow in df_fc.iterrows():
+                asm_dt = frow.get(fc_asm_start_col)
+                if pd.isna(asm_dt):
+                    continue
+
+                month_key = pd.Timestamp(asm_dt).to_period("M").to_timestamp()
+                project_name = str(frow.get(fc_proj_name_col, "Unknown")).strip() if pd.notna(frow.get(fc_proj_name_col)) else "Unknown"
+                row_key = frow.get("_row_key", "")
+                assigned_lots = [l for l in row_lot_assignments.get(row_key, []) if l in saved_lots]
+
+                month_rows.append({
+                    "Month": month_key,
+                    "Project": project_name,
+                    "Row Key": row_key,
+                    "Has Lots": len(assigned_lots) > 0,
+                })
+
+                for lot_nm in assigned_lots:
+                    month_proj_lot_rows.append({
+                        "Month": month_key,
+                        "Project": project_name,
+                        "Lot": lot_nm,
+                        "Project-Lot": f"{project_name} → {lot_nm}",
+                    })
+
+            if month_rows:
+                month_df = pd.DataFrame(month_rows)
+                month_summary = month_df.groupby("Month", as_index=False).agg(
+                    Projects_Scheduled=("Project", "nunique"),
+                    Rows_Scheduled=("Row Key", "nunique"),
+                    Rows_With_Lots=("Has Lots", "sum"),
+                )
+
+                if month_proj_lot_rows:
+                    month_proj_lot_df = pd.DataFrame(month_proj_lot_rows)
+                    month_lot_summary = month_proj_lot_df.groupby("Month", as_index=False).agg(
+                        Unique_Lots_Assigned=("Lot", "nunique"),
+                        Project_Lot_Pairs=("Project-Lot", "nunique"),
+                    )
+                    month_summary = month_summary.merge(month_lot_summary, on="Month", how="left")
+                else:
+                    month_summary["Unique_Lots_Assigned"] = 0
+                    month_summary["Project_Lot_Pairs"] = 0
+
+                month_summary = month_summary.sort_values("Month")
+                month_summary_display = month_summary.copy()
+                month_summary_display["Month"] = month_summary_display["Month"].dt.strftime("%b-%Y")
+
+                st.dataframe(month_summary_display, use_container_width=True, height=250)
+
+                fig_month = go.Figure()
+                fig_month.add_trace(go.Bar(
+                    x=month_summary_display["Month"],
+                    y=month_summary_display["Projects_Scheduled"],
+                    name="Projects",
+                    marker_color="#3b82f6",
+                    text=month_summary_display["Projects_Scheduled"],
+                    textposition="outside",
+                    textfont=dict(color="#e2e8f0", size=12, family="DM Sans"),
+                ))
+                fig_month.add_trace(go.Bar(
+                    x=month_summary_display["Month"],
+                    y=month_summary_display["Unique_Lots_Assigned"],
+                    name="Unique Lots",
+                    marker_color="#8b5cf6",
+                    text=month_summary_display["Unique_Lots_Assigned"],
+                    textposition="outside",
+                    textfont=dict(color="#e2e8f0", size=12, family="DM Sans"),
+                ))
+                fig_month.update_layout(
+                    barmode="group",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#94a3b8"),
+                    margin=dict(l=10, r=10, t=40, b=30),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+                    xaxis_title="",
+                    yaxis_title="Count"
+                )
+                st.plotly_chart(fig_month, use_container_width=True)
+
+                st.markdown("#### Month-wise Project + Lot Analytics")
+                if month_proj_lot_rows:
+                    seq_shortage_df = compute_priority_shortage_dataframe(df_fc, df_bom, saved_lots, row_lot_assignments)
+                    month_proj_lot_view = pd.DataFrame(month_proj_lot_rows)
+                    month_proj_lot_view = month_proj_lot_view.groupby("Month", as_index=False).agg(
+                        Project_Lot_Pairs=("Project-Lot", "nunique")
+                    )
+
+                    if not seq_shortage_df.empty:
+                        seq_shortage_df = seq_shortage_df.copy()
+                        seq_shortage_df["Month"] = pd.to_datetime(seq_shortage_df["Assembly Start Date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                        seq_shortage_df = seq_shortage_df.dropna(subset=["Month"])
+
+                        month_short = seq_shortage_df.groupby("Month", as_index=False).agg(
+                            Total_Unique_Components=("Component Code", "nunique")
+                        )
+                        month_short_only = (
+                            seq_shortage_df[seq_shortage_df["Shortage"] > 0]
+                            .groupby("Month", as_index=False)
+                            .agg(Shortage_Unique_Components=("Component Code", "nunique"))
+                        )
+                        month_short = month_short.merge(month_short_only, on="Month", how="left")
+                        month_short["Shortage_Unique_Components"] = month_short["Shortage_Unique_Components"].fillna(0).astype(int)
+                        month_short["Shortage %"] = (
+                            month_short["Shortage_Unique_Components"]
+                            / month_short["Total_Unique_Components"].replace(0, pd.NA)
+                            * 100
+                        ).fillna(0)
+
+                        month_proj_lot_view = month_proj_lot_view.merge(month_short, on="Month", how="left")
+                    else:
+                        month_proj_lot_view["Total_Unique_Components"] = 0
+                        month_proj_lot_view["Shortage_Unique_Components"] = 0
+                        month_proj_lot_view["Shortage %"] = 0.0
+
+                    month_proj_lot_view = month_proj_lot_view.sort_values("Month")
+                    month_proj_lot_display = month_proj_lot_view.copy()
+                    month_proj_lot_display["Month"] = month_proj_lot_display["Month"].dt.strftime("%b-%Y")
+                    month_proj_lot_display["Shortage %"] = month_proj_lot_display["Shortage %"].map(lambda x: f"{x:.1f}%")
+                    st.dataframe(month_proj_lot_display, use_container_width=True, height=240)
+                else:
+                    st.caption("No lot assignments found for month-wise project + lot analytics.")
+            else:
+                st.caption("Assembly Start Date is required for month-wise analytics.")
+        else:
+            st.caption("Assembly Start Date column not found; month-wise analytics unavailable.")
+
 
 # ═══════════════════════════════════════════════════
 # TAB 3 – SHORTAGE FORECAST (Priority-based Stock Allocation)
 # ═══════════════════════════════════════════════════
 with tab_shortage:
     st.markdown('<div class="section-header">Priority-Based Material Shortage Forecast (Project + Lot)</div>', unsafe_allow_html=True)
-    st.caption("Total Available (On Hand + Incoming PO) is allocated to projects in order of Assembly Start Date. Earlier projects get stock first.")
+    st.caption("Total Available (On Hand + Incoming PO + PO in Receiving) is allocated to projects in order of Assembly Start Date. Earlier projects get stock first.")
 
     row_lot_assignments = load_row_lot_assignments()
     saved_lots = load_saved_lots()
+    shortage_df = compute_priority_shortage_dataframe(df_fc, df_bom, saved_lots, row_lot_assignments)
 
     if bom_comp_code_col and bom_open_qty_col:
-        priority_rows = []
-        for idx, row in df_fc.iterrows():
-            rk = row["_row_key"]
-            pname = str(row.get(fc_proj_name_col, "")).strip() if pd.notna(row.get(fc_proj_name_col)) else "Unknown"
-            asm_date = row.get(fc_asm_start_col) if fc_asm_start_col else None
-            bp = str(row.get(fc_build_period_col, "")).strip() if fc_build_period_col and pd.notna(row.get(fc_build_period_col)) else ""
-            assigned_lots = [l for l in row_lot_assignments.get(rk, []) if l in saved_lots]
-            if not assigned_lots:
-                continue
-            for lot_nm in assigned_lots:
-                priority_rows.append({
-                    "row_key": rk, "project": pname, "lot": lot_nm, "build_period": bp,
-                    "asm_date": asm_date,
-                    "asm_date_sort": asm_date if pd.notna(asm_date) else pd.Timestamp("2099-12-31"),
-                })
-
-        if not priority_rows:
+        if shortage_df.empty:
             st.info("ℹ️  No lots assigned to forecasting rows yet. Assign lots in the **Forecasting** tab first.")
         else:
-            priority_df = pd.DataFrame(priority_rows).sort_values("asm_date_sort").reset_index(drop=True)
-            remaining_stock = stock_agg.set_index("_stk_item")["_stk_total_onhand"].to_dict()
-            all_shortage_rows = []
+            shortage_display = shortage_df.drop(columns=["_asm_sort"], errors="ignore")
 
-            for _, prow in priority_df.iterrows():
-                lot_nm = prow["lot"]
-                lot_info = saved_lots.get(lot_nm, {})
-                if not lot_info:
-                    continue
-                lot_bom_project = lot_info.get("project", "")
-                lot_wo_list = lot_info.get("work_orders", ["-- All --"])
-                lot_item_list = lot_info.get("items", ["-- All --"])
-                df_lot_bom = df_bom.copy()
-                if lot_bom_project and lot_bom_project != "-- All --":
-                    p_col = bom_proj_name_col or bom_proj_num_col
-                    if p_col:
-                        df_lot_bom = df_lot_bom[df_lot_bom[p_col] == lot_bom_project]
-                if lot_wo_list != ["-- All --"] and bom_wo_col:
-                    df_lot_bom = df_lot_bom[df_lot_bom[bom_wo_col].astype(str).isin(lot_wo_list)]
-                if lot_item_list != ["-- All --"] and bom_item_col:
-                    df_lot_bom = df_lot_bom[df_lot_bom[bom_item_col].astype(str).isin(lot_item_list)]
-                if df_lot_bom.empty or not bom_comp_code_col:
-                    continue
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                risk_filter = st.multiselect("Shortage Status", ["🔴 Short", "🟢 OK"], default=["🔴 Short"], key="risk_flt")
+            with f2:
+                proj_flt = st.multiselect("Projects", sorted(shortage_display["Project"].unique().tolist()), key="proj_flt")
+            with f3:
+                lot_flt = st.multiselect("Lots", sorted(shortage_display["Lot"].unique().tolist()), key="lot_flt")
 
-                grp = [bom_comp_code_col]
-                if bom_comp_desc_col:
-                    grp.append(bom_comp_desc_col)
-                agg_dict = {bom_open_qty_col: "sum"}
-                if bom_req_qty_col:
-                    agg_dict[bom_req_qty_col] = "sum"
-                lot_demand = df_lot_bom.groupby(grp, dropna=False).agg(agg_dict).reset_index()
+            base_filtered = shortage_display.copy()
+            if proj_flt:
+                base_filtered = base_filtered[base_filtered["Project"].isin(proj_flt)]
+            if lot_flt:
+                base_filtered = base_filtered[base_filtered["Lot"].isin(lot_flt)]
 
-                for _, comp_row in lot_demand.iterrows():
-                    comp_code = comp_row[bom_comp_code_col]
-                    comp_desc = comp_row.get(bom_comp_desc_col, "") if bom_comp_desc_col else ""
-                    open_qty = comp_row[bom_open_qty_col]
-                    req_qty = comp_row.get(bom_req_qty_col, open_qty) if bom_req_qty_col else open_qty
-                    available = remaining_stock.get(comp_code, 0)
-                    allocated = min(available, open_qty)
-                    shortage = open_qty - allocated
-                    remaining_stock[comp_code] = available - allocated
-                    risk = "🔴 Critical" if shortage > 50 else ("🟡 Warning" if shortage > 0 else "🟢 OK")
-                    all_shortage_rows.append({
-                        "Project": prow["project"], "Lot": lot_nm, "Build Period": prow["build_period"],
-                        "Assembly Start": prow["asm_date"].strftime("%d-%b-%Y") if pd.notna(prow["asm_date"]) and isinstance(prow["asm_date"], pd.Timestamp) else "N/A",
-                        "Component Code": comp_code, "Component Desc": comp_desc,
-                        "Required": int(req_qty), "Open Qty": int(open_qty),
-                        "Stock Available (Before)": int(available), "Allocated": int(allocated),
-                        "Shortage": int(shortage), "Stock Remaining (After)": int(remaining_stock.get(comp_code, 0)),
-                        "Risk": risk, "_asm_sort": prow["asm_date_sort"],
-                    })
+            filtered = base_filtered[base_filtered["Risk"].isin(risk_filter)].copy()
 
-            if all_shortage_rows:
-                shortage_df = pd.DataFrame(all_shortage_rows)
-                shortage_df = shortage_df.sort_values(["_asm_sort", "Project", "Lot", "Shortage"], ascending=[True, True, True, True])
-                shortage_display = shortage_df.drop(columns=["_asm_sort"])
+            short_comp = base_filtered[base_filtered["Risk"] == "🔴 Short"]["Component Code"].nunique()
+            ok_comp = base_filtered[base_filtered["Risk"] == "🟢 OK"]["Component Code"].nunique()
+            shortage_unique = base_filtered[base_filtered["Shortage"] > 0]["Component Code"].nunique()
+            total_unique = base_filtered["Component Code"].nunique()
+            shortage_pct = (shortage_unique / total_unique * 100) if total_unique else 0
 
-                f1, f2, f3 = st.columns(3)
-                with f1:
-                    risk_filter = st.multiselect("Risk Level", ["🔴 Critical", "🟡 Warning", "🟢 OK"], default=["🔴 Critical", "🟡 Warning"], key="risk_flt")
-                with f2:
-                    proj_flt = st.multiselect("Projects", sorted(shortage_display["Project"].unique().tolist()), key="proj_flt")
-                with f3:
-                    lot_flt = st.multiselect("Lots", sorted(shortage_display["Lot"].unique().tolist()), key="lot_flt")
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            with mc1: render_metric("Short Components", short_comp, "red")
+            with mc2: render_metric("OK Components", ok_comp, "emerald")
+            with mc3: render_metric("Total Unique Components", total_unique, "cyan")
+            with mc4: render_metric("Shortage %", f"{shortage_pct:.1f}%", "purple")
 
-                filtered = shortage_display[shortage_display["Risk"].isin(risk_filter)].copy()
-                if proj_flt:
-                    filtered = filtered[filtered["Project"].isin(proj_flt)]
-                if lot_flt:
-                    filtered = filtered[filtered["Lot"].isin(lot_flt)]
+            st.dataframe(filtered, use_container_width=True, height=500)
 
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                with mc1: render_metric("Critical", len(filtered[filtered["Risk"] == "🔴 Critical"]), "red")
-                with mc2: render_metric("Warning", len(filtered[filtered["Risk"] == "🟡 Warning"]), "amber")
-                with mc3: render_metric("OK", len(shortage_display[shortage_display["Risk"] == "🟢 OK"]), "emerald")
-                with mc4: render_metric("Total Shortage Qty", int(filtered["Shortage"].sum()), "purple")
+            st.markdown('<div class="section-header">Project + Lot Shortage Status Heatmap</div>', unsafe_allow_html=True)
+            risk_summary = shortage_display.copy()
+            risk_summary["Proj_Lot"] = risk_summary["Project"] + " → " + risk_summary["Lot"]
+            risk_heatmap = risk_summary.groupby("Proj_Lot").agg(
+                Short=("Risk", lambda x: (x == "🔴 Short").sum()),
+                OK=("Risk", lambda x: (x == "🟢 OK").sum()),
+            ).reset_index().sort_values("Short", ascending=False)
+            risk_heatmap["Total"] = risk_heatmap["Short"] + risk_heatmap["OK"]
+            risk_heatmap["Short %"] = (risk_heatmap["Short"] / risk_heatmap["Total"].replace(0, 1) * 100).round(1)
+            risk_heatmap["OK %"] = (risk_heatmap["OK"] / risk_heatmap["Total"].replace(0, 1) * 100).round(1)
 
-                st.dataframe(filtered, use_container_width=True, height=500)
+            fig_heat = go.Figure()
+            fig_heat.add_trace(go.Bar(
+                y=risk_heatmap["Proj_Lot"], x=risk_heatmap["Short"], name="Short",
+                marker_color="#ef4444", orientation="h",
+                text=risk_heatmap["Short %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside", textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_heat.add_trace(go.Bar(
+                y=risk_heatmap["Proj_Lot"], x=risk_heatmap["OK"], name="OK",
+                marker_color="#10b981", orientation="h",
+                text=risk_heatmap["OK %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside", textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_heat.update_layout(barmode="stack", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#94a3b8"), height=max(300, len(risk_heatmap) * 35),
+                margin=dict(l=10, r=10, t=10, b=30), legend=dict(orientation="h", yanchor="bottom", y=-0.15))
+            st.plotly_chart(fig_heat, use_container_width=True)
 
-                st.markdown('<div class="section-header">Project + Lot Risk Heatmap</div>', unsafe_allow_html=True)
-                risk_summary = shortage_display.copy()
-                risk_summary["Proj_Lot"] = risk_summary["Project"] + " → " + risk_summary["Lot"]
-                risk_heatmap = risk_summary.groupby("Proj_Lot").agg(
-                    Critical=("Risk", lambda x: (x == "🔴 Critical").sum()),
-                    Warning=("Risk", lambda x: (x == "🟡 Warning").sum()),
-                    OK=("Risk", lambda x: (x == "🟢 OK").sum()),
-                ).reset_index().sort_values("Critical", ascending=False)
+            # ───────────────────────────────────────────────
+            # NEW: On-Hand Only Shortage Allocation Table
+            # ───────────────────────────────────────────────
+            st.markdown('<div class="section-header">🏭 On-Hand Only Shortage Allocation</div>', unsafe_allow_html=True)
+            st.caption("Allocation based **only on On Hand Quantity** (excludes Incoming PO and PO in Receiving). Compared against the full allocation above to highlight the gap that PO stock covers.")
 
-                fig_heat = go.Figure()
-                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["Critical"], name="Critical", marker_color="#ef4444", orientation="h"))
-                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["Warning"], name="Warning", marker_color="#f59e0b", orientation="h"))
-                fig_heat.add_trace(go.Bar(y=risk_heatmap["Proj_Lot"], x=risk_heatmap["OK"], name="OK", marker_color="#10b981", orientation="h"))
-                fig_heat.update_layout(barmode="stack", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(color="#94a3b8"), height=max(300, len(risk_heatmap) * 35),
-                    margin=dict(l=10, r=10, t=10, b=30), legend=dict(orientation="h", yanchor="bottom", y=-0.15))
-                st.plotly_chart(fig_heat, use_container_width=True)
+            shortage_oh_df = compute_priority_shortage_dataframe(
+                df_fc, df_bom, saved_lots, row_lot_assignments,
+                stock_agg_override=stock_agg_onhand_only
+            )
 
-                st.markdown("---")
-                st.download_button("⬇️ Download Priority Shortage Report (CSV)",
-                    data=filtered.to_csv(index=False).encode("utf-8"),
-                    file_name=f"priority_shortage_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+            if shortage_oh_df.empty:
+                st.info("No data for On-Hand Only allocation.")
             else:
-                st.info("No component data found for the assigned lots.")
+                shortage_oh_display = shortage_oh_df.drop(columns=["_asm_sort"], errors="ignore")
+
+                # Apply same project/lot filters
+                oh_filtered = shortage_oh_display.copy()
+                if proj_flt:
+                    oh_filtered = oh_filtered[oh_filtered["Project"].isin(proj_flt)]
+                if lot_flt:
+                    oh_filtered = oh_filtered[oh_filtered["Lot"].isin(lot_flt)]
+
+                oh_base = oh_filtered.copy()
+                oh_short_comp = oh_base[oh_base["Risk"] == "🔴 Short"]["Component Code"].nunique()
+                oh_ok_comp = oh_base[oh_base["Risk"] == "🟢 OK"]["Component Code"].nunique()
+                oh_total_unique = oh_base["Component Code"].nunique()
+                oh_shortage_pct = (oh_short_comp / oh_total_unique * 100) if oh_total_unique else 0
+
+                om1, om2, om3, om4 = st.columns(4)
+                with om1: render_metric("Short (OH Only)", oh_short_comp, "red")
+                with om2: render_metric("OK (OH Only)", oh_ok_comp, "emerald")
+                with om3: render_metric("Total Components", oh_total_unique, "cyan")
+                with om4: render_metric("Shortage % (OH Only)", f"{oh_shortage_pct:.1f}%", "purple")
+
+                # Filter by risk if selected
+                oh_risk_filtered = oh_base[oh_base["Risk"].isin(risk_filter)].copy()
+                st.dataframe(oh_risk_filtered, use_container_width=True, height=500)
+
+                # On-Hand Only heatmap
+                st.markdown('<div class="section-header">On-Hand Only – Project + Lot Heatmap</div>', unsafe_allow_html=True)
+                oh_risk_summary = shortage_oh_display.copy()
+                oh_risk_summary["Proj_Lot"] = oh_risk_summary["Project"] + " → " + oh_risk_summary["Lot"]
+                oh_risk_heatmap = oh_risk_summary.groupby("Proj_Lot").agg(
+                    Short=("Risk", lambda x: (x == "🔴 Short").sum()),
+                    OK=("Risk", lambda x: (x == "🟢 OK").sum()),
+                ).reset_index().sort_values("Short", ascending=False)
+                oh_risk_heatmap["Total"] = oh_risk_heatmap["Short"] + oh_risk_heatmap["OK"]
+                oh_risk_heatmap["Short %"] = (oh_risk_heatmap["Short"] / oh_risk_heatmap["Total"].replace(0, 1) * 100).round(1)
+                oh_risk_heatmap["OK %"] = (oh_risk_heatmap["OK"] / oh_risk_heatmap["Total"].replace(0, 1) * 100).round(1)
+
+                fig_oh_heat = go.Figure()
+                fig_oh_heat.add_trace(go.Bar(
+                    y=oh_risk_heatmap["Proj_Lot"], x=oh_risk_heatmap["Short"], name="Short",
+                    marker_color="#ef4444", orientation="h",
+                    text=oh_risk_heatmap["Short %"].map(lambda v: f"{v:.1f}%"),
+                    textposition="inside", textfont=dict(color="white", size=13, family="DM Sans"),
+                ))
+                fig_oh_heat.add_trace(go.Bar(
+                    y=oh_risk_heatmap["Proj_Lot"], x=oh_risk_heatmap["OK"], name="OK",
+                    marker_color="#10b981", orientation="h",
+                    text=oh_risk_heatmap["OK %"].map(lambda v: f"{v:.1f}%"),
+                    textposition="inside", textfont=dict(color="white", size=13, family="DM Sans"),
+                ))
+                fig_oh_heat.update_layout(barmode="stack", plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#94a3b8"), height=max(300, len(oh_risk_heatmap) * 35),
+                    margin=dict(l=10, r=10, t=10, b=30), legend=dict(orientation="h", yanchor="bottom", y=-0.15))
+                st.plotly_chart(fig_oh_heat, use_container_width=True)
+
+                # Comparison summary: Full vs On-Hand Only
+                st.markdown('<div class="section-header">📊 Full Allocation vs On-Hand Only Comparison</div>', unsafe_allow_html=True)
+                comp_data = {
+                    "Metric": ["Short Components", "OK Components", "Shortage %"],
+                    "Full (OH+PO+Recv)": [short_comp, ok_comp, f"{shortage_pct:.1f}%"],
+                    "On-Hand Only": [oh_short_comp, oh_ok_comp, f"{oh_shortage_pct:.1f}%"],
+                    "Delta (OH Only − Full)": [
+                        oh_short_comp - short_comp,
+                        oh_ok_comp - ok_comp,
+                        f"{oh_shortage_pct - shortage_pct:+.1f}%",
+                    ],
+                }
+                st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
+
+                st.download_button("⬇️ Download On-Hand Only Shortage Report (CSV)",
+                    data=oh_risk_filtered.to_csv(index=False).encode("utf-8"),
+                    file_name=f"onhand_only_shortage_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv",
+                    key="dl_oh_shortage")
+
+            st.markdown("---")
+            st.download_button("⬇️ Download Priority Shortage Report (CSV)",
+                data=filtered.to_csv(index=False).encode("utf-8"),
+                file_name=f"priority_shortage_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
     else:
         st.warning("Required columns not found for shortage analysis.")
 
 
 # ═══════════════════════════════════════════════════
-# TAB 4 – TIMELINE
+# TAB 4 – LOT & PROJECT ANALYTICS
+# ═══════════════════════════════════════════════════
+with tab_analytics:
+    st.markdown('<div class="section-header">Lot-wise and Project-wise Shortage Analytics</div>', unsafe_allow_html=True)
+    st.caption("Shortage % = shortage unique component code count / total unique component code count, using sequential allocation from Shortage Forecast.")
+
+    row_lot_assignments = load_row_lot_assignments()
+    saved_lots = load_saved_lots()
+    analytics_df = compute_priority_shortage_dataframe(df_fc, df_bom, saved_lots, row_lot_assignments)
+
+    if analytics_df.empty:
+        st.info("No analytics available yet. Assign lots in Forecasting tab to generate sequential shortage analytics.")
+    else:
+        analytics_df = analytics_df.copy()
+        analytics_df["Is Shortage"] = analytics_df["Shortage"] > 0
+
+        overall_total_unique = analytics_df["Component Code"].nunique()
+        overall_short_unique = analytics_df[analytics_df["Is Shortage"]]["Component Code"].nunique()
+        overall_short_pct = (overall_short_unique / overall_total_unique * 100) if overall_total_unique else 0
+        lots_with_shortage = analytics_df[analytics_df["Is Shortage"]]["Lot"].nunique()
+
+        km1, km2, km3, km4 = st.columns(4)
+        with km1: render_metric("Lots Analyzed", analytics_df["Lot"].nunique(), "blue")
+        with km2: render_metric("Projects Analyzed", analytics_df["Project"].nunique(), "cyan")
+        with km3: render_metric("Lots With Shortages", lots_with_shortage, "red")
+        with km4: render_metric("Overall Shortage %", f"{overall_short_pct:.1f}%", "purple")
+
+        analytics_df["Assembly Start Date"] = pd.to_datetime(analytics_df["Assembly Start Date"], errors="coerce")
+        date_source = analytics_df.dropna(subset=["Assembly Start Date"]).copy()
+
+        if date_source.empty:
+            st.info("Assembly Start Date is not available for date filtering.")
+            date_filtered = analytics_df.copy()
+        else:
+            min_date = date_source["Assembly Start Date"].min().date()
+            max_date = date_source["Assembly Start Date"].max().date()
+            use_date_filter = st.checkbox("Apply Assembly Start Date filter", value=False, key="analytics_use_date_filter")
+            if use_date_filter:
+                selected_range = st.date_input(
+                    "Filter by Assembly Start Date",
+                    value=(min_date, max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                    key="analytics_date_filter"
+                )
+
+                if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                    start_date, end_date = selected_range
+                elif selected_range:
+                    start_date = selected_range
+                    end_date = selected_range
+                else:
+                    start_date = min_date
+                    end_date = max_date
+
+                start_ts = pd.Timestamp(start_date)
+                end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+                date_filtered = analytics_df[
+                    (analytics_df["Assembly Start Date"] >= start_ts)
+                    & (analytics_df["Assembly Start Date"] <= end_ts)
+                ].copy()
+            else:
+                date_filtered = analytics_df.copy()
+
+        project_options = sorted(date_filtered["Project"].dropna().astype(str).unique().tolist())
+        lot_options = sorted(date_filtered["Lot"].dropna().astype(str).unique().tolist())
+
+        af1, af2 = st.columns(2)
+        with af1:
+            analytics_proj_filter = st.multiselect(
+                "Filter Projects (for tables + graphs)",
+                project_options,
+                default=[],
+                key="analytics_proj_filter"
+            )
+        with af2:
+            analytics_lot_filter = st.multiselect(
+                "Filter Lots (for tables + graphs)",
+                lot_options,
+                default=[],
+                key="analytics_lot_filter"
+            )
+
+        analytics_view = date_filtered.copy()
+        if analytics_proj_filter:
+            analytics_view = analytics_view[analytics_view["Project"].isin(analytics_proj_filter)]
+        if analytics_lot_filter:
+            analytics_view = analytics_view[analytics_view["Lot"].isin(analytics_lot_filter)]
+
+        if analytics_view.empty:
+            st.info("No records available for selected Project/Lot filters.")
+        else:
+            lot_rows = []
+            for lot_nm, gdf in analytics_view.groupby("Lot"):
+                total_unique = gdf["Component Code"].nunique()
+                short_unique = gdf[gdf["Is Shortage"]]["Component Code"].nunique()
+                pct = (short_unique / total_unique * 100) if total_unique else 0
+                asm_dt = pd.to_datetime(gdf["Assembly Start Date"], errors="coerce").min()
+                lot_rows.append({
+                    "Assembly Start": asm_dt,
+                    "Lot": lot_nm,
+                    "Projects": gdf["Project"].nunique(),
+                    "Total Unique Components": total_unique,
+                    "Shortage Unique Components": short_unique,
+                    "Shortage %": pct,
+                })
+            lot_summary = pd.DataFrame(lot_rows).sort_values(["Assembly Start", "Lot"], na_position="last")
+            lot_summary_display = lot_summary.copy()
+            lot_summary_display["Assembly Start"] = pd.to_datetime(lot_summary_display["Assembly Start"], errors="coerce").dt.strftime("%d-%b-%Y").fillna("")
+            lot_summary_display["Shortage %"] = lot_summary_display["Shortage %"].map(lambda x: f"{x:.1f}%")
+
+            st.markdown('<div class="section-header">Lot-wise Analytics (Assembly Start on Top)</div>', unsafe_allow_html=True)
+            st.dataframe(lot_summary_display, use_container_width=True, height=320)
+
+            proj_rows = []
+            for proj_nm, gdf in analytics_view.groupby("Project"):
+                total_unique = gdf["Component Code"].nunique()
+                short_unique = gdf[gdf["Is Shortage"]]["Component Code"].nunique()
+                pct = (short_unique / total_unique * 100) if total_unique else 0
+                proj_rows.append({
+                    "Project": proj_nm,
+                    "Lots": gdf["Lot"].nunique(),
+                    "Total Unique Components": total_unique,
+                    "Shortage Unique Components": short_unique,
+                    "Shortage %": pct,
+                })
+            proj_summary = pd.DataFrame(proj_rows).sort_values("Shortage %", ascending=False)
+            proj_summary_display = proj_summary.copy()
+            proj_summary_display["Shortage %"] = proj_summary_display["Shortage %"].map(lambda x: f"{x:.1f}%")
+
+            st.markdown('<div class="section-header">Project-wise Analytics</div>', unsafe_allow_html=True)
+            st.dataframe(proj_summary_display, use_container_width=True, height=320)
+
+            st.markdown('<div class="section-header">Lot-wise Dual Analytics Graph</div>', unsafe_allow_html=True)
+            lot_summary_plot = lot_summary.copy()
+            lot_summary_plot["OK Unique Components"] = (
+                lot_summary_plot["Total Unique Components"] - lot_summary_plot["Shortage Unique Components"]
+            ).clip(lower=0)
+            lot_summary_plot["OK %"] = (
+                lot_summary_plot["OK Unique Components"] / lot_summary_plot["Total Unique Components"].replace(0, 1) * 100
+            ).round(1)
+            lot_summary_plot["Short %"] = lot_summary_plot["Shortage %"].round(1)
+
+            fig_lot_dual = go.Figure()
+            fig_lot_dual.add_trace(go.Bar(
+                y=lot_summary_plot["Lot"],
+                x=lot_summary_plot["OK Unique Components"],
+                name="OK",
+                marker_color="#10b981",
+                orientation="h",
+                text=lot_summary_plot["OK %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside",
+                textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_lot_dual.add_trace(go.Bar(
+                y=lot_summary_plot["Lot"],
+                x=lot_summary_plot["Shortage Unique Components"],
+                name="Short",
+                marker_color="#ef4444",
+                orientation="h",
+                text=lot_summary_plot["Short %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside",
+                textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_lot_dual.update_layout(
+                barmode="stack",
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#94a3b8"),
+                height=max(320, len(lot_summary) * 28),
+                margin=dict(l=10, r=10, t=10, b=30),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+                xaxis_title="Component Count",
+                yaxis_title=""
+            )
+            st.plotly_chart(fig_lot_dual, use_container_width=True)
+
+            st.markdown('<div class="section-header">Project-wise Dual Analytics Graph</div>', unsafe_allow_html=True)
+            proj_summary_plot = proj_summary.copy()
+            proj_summary_plot["OK Unique Components"] = (
+                proj_summary_plot["Total Unique Components"] - proj_summary_plot["Shortage Unique Components"]
+            ).clip(lower=0)
+            proj_summary_plot["OK %"] = (
+                proj_summary_plot["OK Unique Components"] / proj_summary_plot["Total Unique Components"].replace(0, 1) * 100
+            ).round(1)
+            proj_summary_plot["Short %"] = proj_summary_plot["Shortage %"].round(1)
+
+            fig_proj_dual = go.Figure()
+            fig_proj_dual.add_trace(go.Bar(
+                y=proj_summary_plot["Project"],
+                x=proj_summary_plot["OK Unique Components"],
+                name="OK",
+                marker_color="#10b981",
+                orientation="h",
+                text=proj_summary_plot["OK %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside",
+                textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_proj_dual.add_trace(go.Bar(
+                y=proj_summary_plot["Project"],
+                x=proj_summary_plot["Shortage Unique Components"],
+                name="Short",
+                marker_color="#ef4444",
+                orientation="h",
+                text=proj_summary_plot["Short %"].map(lambda v: f"{v:.1f}%"),
+                textposition="inside",
+                textfont=dict(color="white", size=13, family="DM Sans"),
+            ))
+            fig_proj_dual.update_layout(
+                barmode="stack",
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#94a3b8"),
+                height=max(320, len(proj_summary) * 28),
+                margin=dict(l=10, r=10, t=10, b=30),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+                xaxis_title="Component Count",
+                yaxis_title=""
+            )
+            st.plotly_chart(fig_proj_dual, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════
+# TAB 5 – TIMELINE
 # ═══════════════════════════════════════════════════
 with tab_timeline:
-    st.markdown('<div class="section-header">Project Schedule Timeline</div>', unsafe_allow_html=True)
-
     if fc_proj_name_col:
-        show_data_labels = st.checkbox("📌 Show date labels on chart", value=False, key="tl_data_labels")
-
-        timeline_rows = []
-        for _, row in df_fc.iterrows():
-            pname = row.get(fc_proj_name_col, "Unknown")
-            if pd.isna(pname):
-                continue
-            asm_s = row.get(fc_asm_start_col) if fc_asm_start_col else None
-            asm_e = row.get(fc_asm_end_col) if fc_asm_end_col else None
-            if pd.notna(asm_s) and pd.notna(asm_e):
-                timeline_rows.append({"Project": str(pname), "Phase": "Assembly", "Start": asm_s, "End": asm_e})
-            elif pd.notna(asm_s):
-                timeline_rows.append({"Project": str(pname), "Phase": "Assembly", "Start": asm_s, "End": asm_s + timedelta(days=7)})
-            fat_s = row.get(fc_fat_start_col) if fc_fat_start_col else None
-            need_by = row.get(fc_need_by_col) if fc_need_by_col else None
-            if pd.notna(fat_s):
-                timeline_rows.append({"Project": str(pname), "Phase": "FAT", "Start": fat_s, "End": need_by if pd.notna(need_by) else fat_s + timedelta(days=5)})
-            if pd.notna(need_by):
-                timeline_rows.append({"Project": str(pname), "Phase": "Shipment", "Start": need_by, "End": need_by + timedelta(days=3)})
-            mat = row.get(fc_mat_avail_col) if fc_mat_avail_col else None
-            if pd.notna(mat):
-                timeline_rows.append({"Project": str(pname), "Phase": "Material Avail", "Start": mat, "End": mat + timedelta(days=1)})
-
-        if timeline_rows:
-            tl_df = pd.DataFrame(timeline_rows)
-            tl_df["Start"] = pd.to_datetime(tl_df["Start"], errors="coerce")
-            tl_df["End"] = pd.to_datetime(tl_df["End"], errors="coerce")
-            tl_df = tl_df.dropna(subset=["Start", "End"])
-
-            fig_tl = px.timeline(tl_df, x_start="Start", x_end="End", y="Project", color="Phase",
-                color_discrete_map={"Assembly": "#3b82f6", "FAT": "#8b5cf6", "Shipment": "#f59e0b", "Material Avail": "#10b981"})
-            fig_tl.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#94a3b8"),
-                height=max(400, len(tl_df["Project"].unique()) * 40), margin=dict(l=10, r=10, t=10, b=30),
-                legend=dict(orientation="h", yanchor="bottom", y=-0.15), xaxis_title="", yaxis_title="")
-            fig_tl.update_yaxes(autorange="reversed")
-
-            if show_data_labels:
-                annotations = []
-                for trace in fig_tl.data:
-                    if hasattr(trace, 'base') and trace.base is not None:
-                        for i, (b, x_val, y_val) in enumerate(zip(trace.base, trace.x, trace.y)):
-                            try:
-                                start_dt = pd.Timestamp(b)
-                                end_dt = start_dt + pd.Timedelta(milliseconds=x_val)
-                                mid_dt = start_dt + (end_dt - start_dt) / 2
-                                label_text = f"{start_dt.strftime('%d-%b-%Y')} → {end_dt.strftime('%d-%b-%Y')}"
-                                annotations.append(dict(
-                                    x=mid_dt, y=y_val, text=f"<b>{label_text}</b>",
-                                    showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor="#94a3b8",
-                                    ax=0, ay=-35,
-                                    font=dict(size=11, color="#e2e8f0", family="DM Sans"),
-                                    bgcolor="rgba(30,41,59,0.85)", bordercolor="#475569", borderwidth=1, borderpad=4, align="center",
-                                ))
-                            except Exception:
-                                continue
-                fig_tl.update_layout(annotations=annotations, margin=dict(l=10, r=10, t=60, b=30))
-
-            st.plotly_chart(fig_tl, use_container_width=True)
-        else:
-            st.info("No date data available to build timeline.")
-
         # ── Projects + Assigned Lots Schedule ──
         st.markdown('<div class="section-header">📦 Projects + Assigned Lots Schedule (by Assembly Start Date)</div>', unsafe_allow_html=True)
         st.caption("Only projects with assigned lots are shown, sorted by Assembly Start Date.")
@@ -1190,12 +1933,14 @@ with tab_timeline:
             cab_qty = row.get(fc_cab_qty_col, 0) if fc_cab_qty_col else 0
             for lot_nm in assigned:
                 lot_info = saved_lots.get(lot_nm, {})
+                lot_metrics = compute_lot_metrics(df_bom, lot_info)
                 lot_schedule_rows.append({
                     "Project": pname, "Build Period": bp, "Assembly Start": asm_start, "Assembly End": asm_end,
                     "Need By Date": need_by, "Status": status, "Cabinets": int(cab_qty) if pd.notna(cab_qty) else 0,
-                    "Assigned Lot": lot_nm, "Lot BOM Project": lot_info.get("project", "N/A"),
-                    "Lot Components": lot_info.get("component_count", 0), "Lot Short": lot_info.get("short_components", 0),
-                    "Lot Open Qty": lot_info.get("total_open_qty", 0),
+                    "Assigned Lot": lot_nm, "Lot Project": get_lot_project_name(lot_info) or "N/A",
+                    "Lot ROW / ROM": get_lot_row_number(lot_info) or "N/A",
+                    "Lot Components": lot_metrics["component_count"], "Lot Short": lot_metrics["short_components"],
+                    "Lot Open Qty": lot_metrics["total_open_qty"],
                     "_asm_sort": asm_start if pd.notna(asm_start) else pd.Timestamp("2099-12-31"),
                 })
 
@@ -1237,60 +1982,8 @@ with tab_timeline:
                     legend=dict(orientation="h", yanchor="bottom", y=-0.15), xaxis_title="", yaxis_title="")
                 fig_lot_tl.update_yaxes(autorange="reversed")
 
-                if show_data_labels:
-                    annotations_lot = []
-                    for trace in fig_lot_tl.data:
-                        if hasattr(trace, 'base') and trace.base is not None:
-                            for i, (b, x_val, y_val) in enumerate(zip(trace.base, trace.x, trace.y)):
-                                try:
-                                    start_dt = pd.Timestamp(b)
-                                    end_dt = start_dt + pd.Timedelta(milliseconds=x_val)
-                                    mid_dt = start_dt + (end_dt - start_dt) / 2
-                                    label_text = f"{start_dt.strftime('%d-%b-%Y')} → {end_dt.strftime('%d-%b-%Y')}"
-                                    annotations_lot.append(dict(
-                                        x=mid_dt, y=y_val, text=f"<b>{label_text}</b>",
-                                        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor="#94a3b8",
-                                        ax=0, ay=-35,
-                                        font=dict(size=11, color="#e2e8f0", family="DM Sans"),
-                                        bgcolor="rgba(30,41,59,0.85)", bordercolor="#475569", borderwidth=1, borderpad=4, align="center",
-                                    ))
-                                except Exception:
-                                    continue
-                    fig_lot_tl.update_layout(annotations=annotations_lot, margin=dict(l=10, r=10, t=60, b=30))
-
                 st.plotly_chart(fig_lot_tl, use_container_width=True)
         else:
             st.info("No lots assigned to any forecasting rows yet. Assign lots in the Forecasting tab.")
-
-        # Upcoming Deadlines
-        st.markdown('<div class="section-header">Upcoming Deadlines (Next 60 Days)</div>', unsafe_allow_html=True)
-        today = pd.Timestamp.now().normalize()
-        cutoff = today + timedelta(days=60)
-        deadlines = []
-        for _, row in df_fc.iterrows():
-            pname = row.get(fc_proj_name_col, "Unknown")
-            for col, label in [(fc_need_by_col, "Shipment"), (fc_fat_start_col, "FAT Start"), (fc_asm_start_col, "Assembly Start"), (fc_mat_avail_col, "Material Avail")]:
-                if col:
-                    dt = row.get(col)
-                    if pd.notna(dt) and isinstance(dt, pd.Timestamp) and today <= dt <= cutoff:
-                        deadlines.append({"Project": pname, "Milestone": label, "Date": dt, "Days Until": (dt - today).days})
-        if deadlines:
-            st.dataframe(pd.DataFrame(deadlines).sort_values("Days Until"), use_container_width=True, height=300)
-        else:
-            st.info("No upcoming deadlines within 60 days.")
     else:
         st.warning("Project Name column not found.")
-
-
-# ═══════════════════════════════════════════════════
-# TAB 5 – RAW DATA
-# ═══════════════════════════════════════════════════
-with tab_raw:
-    st.markdown('<div class="section-header">Uploaded Raw Data Preview</div>', unsafe_allow_html=True)
-    raw_tab1, raw_tab2 = st.tabs(["Forecasting", "Open Orders BOM"])
-    with raw_tab1:
-        st.markdown(f"**Rows:** {len(df_fc)}  |  **Columns:** {len(df_fc.columns)}")
-        st.dataframe(df_fc.drop(columns=["_row_key", "_row_label"], errors="ignore"), use_container_width=True, height=500)
-    with raw_tab2:
-        st.markdown(f"**Rows:** {len(df_bom)}  |  **Columns:** {len(df_bom.columns)}")
-        st.dataframe(df_bom.drop(columns=["_total_available"], errors="ignore"), use_container_width=True, height=500)

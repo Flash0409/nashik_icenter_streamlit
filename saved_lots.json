@@ -1,67 +1,42 @@
 {
   "volta lot 1": {
-    "project": "Volta Taziz DCS",
-    "work_orders": [
-      "-- All --"
-    ],
-    "items": [
-      "NKAEPW336071800G06",
-      "NKAEPW336071800G07"
-    ],
-    "item_labels": [
-      "NKAEPW336071800G06 \u2014 SYS CAB -01",
-      "NKAEPW336071800G07 \u2014 SYS CAB -02"
-    ],
-    "work_order_count": 0,
-    "item_count": 2,
-    "work_order": "All",
-    "item": "NKAEPW336071800G06, NKAEPW336071800G07",
-    "saved_at": "2026-03-26T15:18:01.966488",
-    "component_count": 64,
-    "short_components": 0,
-    "total_open_qty": 4939,
-    "total_required_qty": 4939
+    "project_name": "Volta Taziz DCS",
+    "row_number": ""
   },
   "1 volta": {
-    "project": "Volta Taziz DCS",
-    "work_orders": [
-      "-- All --"
-    ],
-    "items": [
-      "NKAEPW336071800G06"
-    ],
-    "item_labels": [
-      "NKAEPW336071800G06 \u2014 SYS CAB -01"
-    ],
-    "work_order_count": 0,
-    "item_count": 1,
-    "work_order": "All",
-    "item": "NKAEPW336071800G06",
-    "saved_at": "2026-03-26T17:05:02.586126",
-    "component_count": 64,
-    "short_components": 18,
-    "total_open_qty": 2470,
-    "total_required_qty": 2470
+    "project_name": "Volta Taziz DCS",
+    "row_number": ""
   },
   "rabiha 1": {
-    "project": "PDO Rabiha",
-    "work_orders": [
-      "47312943.0"
-    ],
-    "items": [
-      "-- All --"
-    ],
-    "item_labels": [
-      "-- All --"
-    ],
-    "work_order_count": 1,
-    "item_count": 1,
-    "work_order": "47312943.0",
-    "item": "All",
-    "saved_at": "2026-03-26T17:08:33.280991",
-    "component_count": 81,
-    "short_components": 32,
-    "total_open_qty": 1354,
-    "total_required_qty": 2626
+    "project_name": "PDO Rabiha",
+    "row_number": ""
+  },
+  "VOLTA 2": {
+    "project_name": "Volta Taziz DCS",
+    "row_number": ""
+  },
+  "akn 1": {
+    "project_name": "AKN Saran PH1",
+    "row_number": ""
+  },
+  "Taziz1": {
+    "project_name": "TAZIZ Logistic",
+    "row_number": ""
+  },
+  "QG OPEN": {
+    "project_name": "QatarGas NFS 500JB",
+    "row_number": ""
+  },
+  "noor1": {
+    "project_name": "Noor PWCS",
+    "row_number": ""
+  },
+  "mangal": {
+    "project_name": "MANGAL CEMENT",
+    "row_number": "1"
+  },
+  "ALr": {
+    "project_name": "Alrar Boosting Phase",
+    "row_number": "3"
   }
 }
